@@ -1,0 +1,44 @@
+{
+  "name": "aurora-agent",
+  "version": "1.0.2",
+  "description": "AURORA Update Control Endpoint Agent",
+  "main": "main.js",
+  "scripts": {
+    "build:win": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "package.json"
+    ],
+    "appId": "com.aurora.control.agent",
+    "productName": "AURORA Update Agent",
+    "directories": {
+      "output": "../dist-installers"
+    },
+    "extraResources": [
+      {
+        "from": "resources/",
+        "to": "."
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh",
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true
+    }
+  }
+}

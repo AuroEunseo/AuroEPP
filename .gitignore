@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-installers/
+out/
+release/
+*.zip
+*.exe
+*.msi
+*.blockmap
+.env

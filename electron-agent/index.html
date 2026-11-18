@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>AURORA Update Agent 설정</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 22px;
+    background: #090d16; color: #f1f5f9;
+    font-family: 'Malgun Gothic', -apple-system, sans-serif;
+  }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  h1 { margin: 0; font-size: 18px; color: #38bdf8; }
+  .badges { display: flex; gap: 6px; }
+  .badge { font-size: 11px; padding: 4px 9px; border-radius: 999px; font-weight: 600; }
+  .run { background: rgba(16,185,129,0.18); color: #34d399; }
+  .stop { background: rgba(244,63,94,0.18); color: #fb7185; }
+  .card {
+    background: #0f172a; border: 1px solid rgba(148,163,184,0.2);
+    border-radius: 10px; padding: 16px; margin-bottom: 14px;
+  }
+  .card-title { font-size: 13px; font-weight: 700; color: #e2e8f0; margin-bottom: 12px; }
+  .row { display: flex; gap: 10px; }
+  .field { flex: 1; }
+  .field.port { flex: 0 0 110px; }
+  label { display: block; font-size: 11px; color: #94a3b8; margin-bottom: 5px; }
+  input {
+    width: 100%; background: #060a12; border: 1px solid rgba(148,163,184,0.3);
+    border-radius: 7px; padding: 8px 10px; color: #fff; font-family: Consolas, monospace; font-size: 13px;
+  }
+  input:focus { outline: none; border-color: #38bdf8; }
+  .btn {
+    width: 100%; margin-top: 12px; padding: 10px; border: none; border-radius: 8px;
+    background: linear-gradient(135deg, #0ea5e9, #6366f1); color: #fff;
+    font-weight: 700; font-size: 13px; cursor: pointer;
+  }
+  .btn:hover { opacity: 0.92; }
+  .btn-sub {
+    background: #1e293b; border: 1px solid rgba(148,163,184,0.25);
+    color: #cbd5e1; padding: 5px 10px; border-radius: 6px; font-size: 11px; cursor: pointer;
+  }
+  .info-line { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 8px; }
+  .mono { font-family: Consolas, monospace; color: #7dd3fc; word-break: break-all; }
+  .msg { margin-top: 10px; font-size: 12px; color: #34d399; min-height: 18px; }
+  .hint { font-size: 11px; color: #64748b; text-align: center; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>AURORA Update Agent</h1>
+    <div class="badges">
+      <span id="netBadge" class="badge stop">서버 확인 중</span>
+      <span id="svcBadge" class="badge stop">서비스 확인 중</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">중앙 관제 서버 연결 설정</div>
+    <div class="row">
+      <div class="field">
+        <label>관제 서버 IP 또는 호스트명</label>
+        <input id="serverIp" placeholder="예: 192.168.0.50" />
+      </div>
+      <div class="field port">
+        <label>포트</label>
+        <input id="serverPort" type="number" placeholder="8080" />
+      </div>
+    </div>
+    <button class="btn" onclick="saveSettings()">저장 및 서버 재연결</button>
+    <div id="statusMsg" class="msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">에이전트 식별 및 인증 토큰 (콘솔 승인 대조용)</div>
+    <div class="info-line">
+      <span style="color:#94a3b8;">Machine ID</span>
+      <span id="machineId" class="mono">-</span>
+    </div>
+    <div style="margin-top:8px;">
+      <div class="info-line" style="margin-bottom:4px;">
+        <span style="color:#94a3b8;">자체 발급 인증 토큰</span>
+        <button class="btn-sub" onclick="copyToken()">전체 복사</button>
+      </div>
+      <input id="agentToken" readonly style="color:#a5b4fc; font-size:11px;" />
+    </div>
+  </div>
+
+  <div class="hint">창을 닫아도 트레이 아이콘으로 백그라운드에서 계속 실행됩니다.</div>
+
+<script>
+  let rawToken = '';
+
+  async function loadState() {
+    if (!window.agentApi) {
+      document.getElementById('statusMsg').textContent = 'IPC 브릿지(preload.js) 로드 오류';
+      return;
+    }
+    const s = await window.agentApi.getState();
+    const svcBadge = document.getElementById('svcBadge');
+    const netBadge = document.getElementById('netBadge');
+
+    if (s.serviceStatus === 'RUNNING') {
+      svcBadge.textContent = '● 서비스 가동';
+      svcBadge.className = 'badge run';
+    } else {
+      svcBadge.textContent = '● 서비스 중지';
+      svcBadge.className = 'badge stop';
+    }
+
+    if (s.serverReachable) {
+      netBadge.textContent = '● 서버 연결됨';
+      netBadge.className = 'badge run';
+    } else {
+      netBadge.textContent = '● 서버 미연결';
+      netBadge.className = 'badge stop';
+    }
+
+    // 사용자가 입력 중일 때는 입력칸 덮어쓰지 않음
+    if (document.activeElement !== document.getElementById('serverIp')) {
+      document.getElementById('serverIp').value = s.config.server_ip || '127.0.0.1';
+    }
+    if (document.activeElement !== document.getElementById('serverPort')) {
+      document.getElementById('serverPort').value = s.config.server_port || 8080;
+    }
+
+    document.getElementById('machineId').textContent = s.identity.machine_id || '서비스 시작 대기 중';
+    rawToken = s.identity.agent_token || '';
+    document.getElementById('agentToken').value = rawToken || '미발급 (서비스 시작 시 자동 생성)';
+  }
+
+  async function saveSettings() {
+    const ip = document.getElementById('serverIp').value;
+    const port = document.getElementById('serverPort').value;
+    const msg = document.getElementById('statusMsg');
+    msg.style.color = '#38bdf8';
+    msg.textContent = '설정 저장 및 서비스 재시작 중...';
+    const res = await window.agentApi.saveConfig(ip, port);
+    msg.style.color = res.ok ? '#34d399' : '#fb7185';
+    msg.textContent = res.message;
+    setTimeout(loadState, 1500);
+  }
+
+  function copyToken() {
+    if (!rawToken) return;
+    navigator.clipboard.writeText(rawToken);
+    const msg = document.getElementById('statusMsg');
+    msg.style.color = '#34d399';
+    msg.textContent = '에이전트 인증 토큰이 클립보드에 복사되었습니다.';
+  }
+
+  loadState();
+  setInterval(loadState, 5000);
+</script>
+</body>
+</html>
