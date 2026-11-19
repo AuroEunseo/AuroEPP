@@ -2,15 +2,12 @@ import React from 'react';
 import { RefreshCw, Undo2, ShieldX } from 'lucide-react';
 import { apiFetch, errorMessage } from '../api';
 import { Agent } from '../types';
-
-interface Props {
-  rejected: Agent[];
-  onRefresh: () => void;
-  onToast: (msg: string) => void;
-}
+import { useConsole } from '../context/ConsoleContext';
 
 /** 승인 거부된 PC 목록. '거부 해제' 시 승인 대기 목록으로 이동하고, 에이전트 응답이 확인되면 승인할 수 있다. */
-export const RejectedPcs: React.FC<Props> = ({ rejected, onRefresh, onToast }) => {
+export const RejectedPcsPage: React.FC = () => {
+  const { state, fetchState: onRefresh, showToast: onToast } = useConsole();
+  const rejected = state.rejected_agents || [];
   const unreject = async (a: Agent) => {
     if (!confirm(`[${a.hostname}] PC를 거부 목록에서 제거하고 승인 대기로 되돌릴까요?`)) return;
     try {

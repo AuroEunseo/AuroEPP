@@ -2,11 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Bell, CheckCheck, Check, RefreshCw } from 'lucide-react';
 import { apiFetch, errorMessage } from '../api';
 import { NotificationItem } from '../types';
-
-interface Props {
-  onChanged: () => void; // 사이드바 배지 갱신용
-  onOpenPc?: (machineId: string) => void;
-}
+import { useConsole } from '../context/ConsoleContext';
 
 const LEVEL_STYLE: Record<string, { label: string; cls: string }> = {
   info: { label: '안내', cls: 'badge-ok' },
@@ -25,7 +21,18 @@ const CATEGORY_LABEL: Record<string, string> = {
 };
 
 /** 확인이 필요한 이벤트 모음. '확인'을 누르면 서버에서 삭제되어 다시 표시되지 않는다. */
-export const NotificationsPanel: React.FC<Props> = ({ onChanged, onOpenPc }) => {
+export const NotificationsPage: React.FC = () => {
+  const { state, fetchState, openAgent, navigate, showToast } = useConsole();
+  const onChanged = fetchState; // 사이드바 배지 갱신용
+
+  // [PC 보기]: 관리중 PC면 상세 열기, 승인 대기/거부 PC면 해당 목록으로 이동
+  const onOpenPc = (mid: string) => {
+    const a = state.agents.find((x) => x.machine_id === mid);
+    if (a) openAgent(a);
+    else if ((state.pending_agents || []).some((x) => x.machine_id === mid)) navigate('pcs-pending');
+    else if ((state.rejected_agents || []).some((x) => x.machine_id === mid)) navigate('pcs-rejected');
+    else showToast('해당 PC는 현재 관리 목록에 없습니다.');
+  };
   const [items, setItems] = useState<NotificationItem[]>([]);
   const [error, setError] = useState('');
 
@@ -104,7 +111,7 @@ export const NotificationsPanel: React.FC<Props> = ({ onChanged, onOpenPc }) => 
                       {new Date(n.ts * 1000).toLocaleString('ko-KR')} · {CATEGORY_LABEL[n.category] || n.category}
                     </div>
                   </div>
-                  {n.machine_id && onOpenPc && (
+                  {n.machine_id && (
                     <button className="btn btn-ghost" style={{ padding: '5px 10px', fontSize: 11.5 }} onClick={() => onOpenPc(n.machine_id)}>
                       PC 보기
                     </button>
