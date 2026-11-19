@@ -18,7 +18,7 @@
       "package.json"
     ],
     "appId": "com.aurora.control.agent",
-    "productName": "AURORA Endpoit Agent",
+    "productName": "AURORA Endpoint Agent",
     "directories": {
       "output": "../dist-installers"
     },

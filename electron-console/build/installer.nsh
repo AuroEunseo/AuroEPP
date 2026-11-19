@@ -2,6 +2,11 @@
 !define AURORA_TASK_NAME "AURORA Control Console"
 !define AURORA_PORT "1557"
 
+; 설치/업데이트 시작 전에 실행 중인 콘솔과 서버 엔진을 종료 (파일 잠김·고아 엔진 방지)
+!macro customInit
+  nsExec::ExecToLog 'taskkill /F /IM AuroraServerEngine.exe /T'
+!macroend
+
 !macro customInstall
   ; 관제 서버 포트(기본 1557) 인바운드 허용. 포트를 바꾸면 server_config.json과 이 규칙을 함께 수정
   DetailPrint "Windows 방화벽에 AURORA 관제 서버 포트(${AURORA_PORT}) 허용 규칙 추가 중..."

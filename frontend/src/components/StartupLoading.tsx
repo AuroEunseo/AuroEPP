@@ -14,6 +14,7 @@ const MIN_SHOW_MS = 1200; // 너무 빨리 지나가 화면이 깜빡이지 않�
 export const StartupLoading: React.FC<Props> = ({ onReady, onUnauthorized }) => {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [fetchError, setFetchError] = useState('');
+  const [attempt, setAttempt] = useState(0); // [다시 시도] 시 폴링 재시작
   const startedAt = useRef(Date.now());
 
   useEffect(() => {
@@ -42,7 +43,17 @@ export const StartupLoading: React.FC<Props> = ({ onReady, onUnauthorized }) => 
       stop = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [onReady, onUnauthorized]);
+  }, [onReady, onUnauthorized, attempt]);
+
+  const retry = async () => {
+    try {
+      await apiFetch('/system/retry', {});
+      setStatus(null);
+      setAttempt((n) => n + 1);
+    } catch (e) {
+      setFetchError(errorMessage(e));
+    }
+  };
 
   const steps = status?.steps || [];
   const isError = status?.phase === 'error';
@@ -83,6 +94,11 @@ export const StartupLoading: React.FC<Props> = ({ onReady, onUnauthorized }) => 
             {status?.error}
             <br />
             백업 파일: <span className="mono">{status?.backup_file || '없음'}</span> (서버 데이터 폴더의 backups)
+            <div style={{ marginTop: 12 }}>
+              <button className="btn btn-primary" onClick={retry}>
+                다시 시도
+              </button>
+            </div>
           </div>
         )}
         {fetchError && <div style={{ marginTop: 12, fontSize: 12, color: '#f59e0b' }}>{fetchError}</div>}

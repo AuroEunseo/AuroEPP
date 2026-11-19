@@ -1,5 +1,5 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, dialog, ipcMain } = require('electron');
-const { spawn, exec, execFile } = require('child_process');
+const { spawn, exec, execFile, execSync } = require('child_process');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -30,7 +30,19 @@ const START_MINIMIZED = process.argv.includes('--minimized') || process.argv.inc
 const TRAY_ICON_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgGJbgPxQzpKWl/WdkZGRgYmJigLJhGKwBiiHg6uvr/4eHh/+H8YEmwTQMDw8HYmJi/v/9+xeiB6YaWRjZALhiZANQxckGoIkTNYDUwR41gPgAAJ9/J+7S5Y1NAAAAAElFTkSuQmCC';
 
+// 이전 실행(또는 이전 버전 설치본)에서 남은 서버 엔진 정리
+// 콘솔 창만 닫히고 엔진이 고아 프로세스로 남으면, 새 엔진이 포트를 못 열고
+// 콘솔이 '이전 엔진'에 접속해 엉뚱한 상태(예: DB 오류 화면)를 보여주는 문제가 생긴다.
+function killOrphanServerEngines() {
+  try {
+    execSync('taskkill /F /IM AuroraServerEngine.exe /T', { stdio: 'ignore', windowsHide: true });
+  } catch (e) {
+    /* 실행 중인 엔진이 없으면 오류 코드가 반환되므로 무시 */
+  }
+}
+
 function startBackendServer() {
+  killOrphanServerEngines();
   const isPackaged = app.isPackaged;
   const serverExe = isPackaged
     ? path.join(process.resourcesPath, 'AuroraServerEngine', 'AuroraServerEngine.exe')
@@ -40,6 +52,16 @@ function startBackendServer() {
   serverProcess = spawn(serverExe, [], {
     cwd: path.dirname(serverExe),
     windowsHide: true,
+  });
+
+  serverProcess.on('exit', (code) => {
+    if (!isQuitting && code !== 0 && code !== null) {
+      dialog.showErrorBox(
+        '서버 엔진 종료됨',
+        `관제 서버 엔진이 비정상 종료되었습니다 (코드 ${code}).\n` +
+          `포트 ${PORT}을(를) 다른 프로그램이 사용 중인지, 관리자 권한으로 실행했는지 확인하세요.`
+      );
+    }
   });
 
   serverProcess.on('error', (err) => {
@@ -185,6 +207,15 @@ async function createWindow() {
     dialog.showErrorBox('연결 실패', e.message);
   }
 }
+
+app.on('before-quit', () => {
+  isQuitting = true;
+  if (serverProcess && !serverProcess.killed) {
+    try {
+      serverProcess.kill();
+    } catch (e) {}
+  }
+});
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {

@@ -2,6 +2,7 @@ import json
 import queue
 import socket
 import ctypes
+import sys
 import platform
 import uuid
 import winreg
@@ -13,6 +14,7 @@ import urllib.request
 
 import os
 
+from agent_log import get_logger
 from config import DATA_DIR, load_server_url
 from identity import wait_for_approval, get_os_info, get_or_create_identity
 from wua_engine import (
@@ -32,6 +34,21 @@ REPORT_HISTORY_MAX = 30       # 정기 보고 시 전송하는 설치/제거 이
 FULL_HISTORY_MAX = 100        # 상세 모달 요청 시 전송하는 전체 이력 최대 건수
 REG_HISTORY_FILE = os.path.join(DATA_DIR, "registry_history.json")
 REG_HISTORY_KEEP = 200
+
+log = get_logger()
+
+
+def get_boot_ts() -> float | None:
+    """PC 마지막 부팅 시각(epoch). 서버가 '부팅 후 재연결'과 대기 중 재부팅 명령 생략 여부를 판단하는 데 사용"""
+    try:
+        if sys.platform == "win32":
+            ms = ctypes.windll.kernel32.GetTickCount64
+            ms.restype = ctypes.c_ulonglong
+            return round(time.time() - ms() / 1000.0, -1)  # 10초 단위로 맞춰 매 보고마다 흔들리지 않게
+        with open("/proc/uptime") as f:
+            return round(time.time() - float(f.read().split()[0]), -1)
+    except Exception:
+        return None
 
 
 def _install_uninstall_only(hist: list[dict], limit: int) -> list[dict]:
@@ -54,6 +71,8 @@ class AgentWorker:
         # SSE 푸시 수신 시 체크인 대기를 즉시 깨우기 위한 이벤트
         self.wake_event = threading.Event()
         self.approved = False
+        self.service_started_at = time.time()
+        self.first_checkin = True
         # 서버 전송 대기 중인 레지스트리 변경 기록 (전송 성공 시에만 비움)
         self.pending_reg_changes: list[dict] = self._load_unsent_reg_changes()
 
@@ -233,6 +252,7 @@ class AgentWorker:
     def _run_command(self, cmd: dict):
         ctype = cmd.get("type")
         cpayload = cmd.get("payload") or {}
+        log.info("명령 수신: %s %s", ctype, cpayload.get("kb", "") if isinstance(cpayload, dict) else "")
         kb = cpayload.get("kb", "")
 
         if ctype == "scan":
@@ -287,12 +307,16 @@ class AgentWorker:
     def run(self):
         threading.Thread(target=self._bg_worker, daemon=True).start()
         hw_specs = self.get_hardware_specs()
+        log.info("에이전트 시작 (버전 %s, 서버 %s, 부팅 시각 %s)", AGENT_VER, load_server_url(),
+                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(get_boot_ts() or 0)))
 
         while not self.stop_event.is_set():
             # Step 1: Wait for admin approval in console
             self.approved = False
             ident = wait_for_approval(load_server_url, AGENT_VER, self.stop_event, wait_fn=self._wait)
             self.approved = True
+            log.info("승인 확인 → 체크인 시작")
+            fail_count = 0
 
             applied_hash = ""
             seen_rules_hash = None
@@ -332,6 +356,9 @@ class AgentWorker:
                     "hotfix": hotfix,
                     "agent_ver": AGENT_VER,
                     "results": results_payload,
+                    "boot_ts": get_boot_ts(),
+                    "service_started_at": self.service_started_at,
+                    "first_checkin": self.first_checkin,
                 }
                 if report_payload:
                     body["updates"] = report_payload["updates"]
@@ -353,6 +380,12 @@ class AgentWorker:
                     )
                     with urllib.request.urlopen(req, timeout=15) as resp:
                         res = json.loads(resp.read().decode("utf-8"))
+                    if self.first_checkin or fail_count:
+                        log.info("체크인 성공%s (대기 명령 %d건 수신)",
+                                 f" (실패 {fail_count}회 후 복구)" if fail_count else " (서비스 시작 후 첫 연결)",
+                                 len(res.get("commands", [])))
+                    self.first_checkin = False
+                    fail_count = 0
 
                     self.global_rules = res.get("rules", [])
 
@@ -401,10 +434,23 @@ class AgentWorker:
 
                 except urllib.error.HTTPError as e:
                     self._restore_unsent(report_payload, results_payload)
-                    if e.code in (401, 403, 404):
+                    # 토큰을 새로 만드는 것은 서버가 '토큰 불일치(401)'를 알린 경우뿐.
+                    # 404(서버 기록 없음)·403(승인 대기/거부)은 기존 토큰으로 재등록 → 토큰을 잃고 재승인이 필요해지는 일을 방지
+                    if e.code == 401:
+                        log.warning("체크인 401: 토큰 불일치(폐기됨) → 새 토큰으로 재등록")
                         get_or_create_identity(force_new_token=True)
                         break
-                except Exception:
+                    if e.code in (403, 404):
+                        log.warning("체크인 %s: %s → 기존 토큰으로 재등록 대기", e.code,
+                                    "승인 대기/거부 상태" if e.code == 403 else "서버에 PC 기록 없음")
+                        break
+                    fail_count += 1
+                    log.warning("체크인 실패: HTTP %s (%d회째)", e.code, fail_count)
+                except Exception as e:
                     self._restore_unsent(report_payload, results_payload)
+                    fail_count += 1
+                    if fail_count in (1, 3) or fail_count % 30 == 0:
+                        log.warning("체크인 실패: %s (%d회째)", e, fail_count)
 
-                self._wait(CHECKIN_INTERVAL)
+                # 연결 실패 시에는 짧게(3→6→12초) 재시도해 부팅·네트워크 복구 직후 빠르게 재연결
+                self._wait(min(3 * (2 ** (fail_count - 1)), CHECKIN_INTERVAL) if fail_count else CHECKIN_INTERVAL)

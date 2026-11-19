@@ -15,7 +15,7 @@ import time
 from sqlalchemy import inspect, text
 from sqlalchemy.schema import CreateTable
 
-from .database import BASE_DIR, DATABASE_URL, Base, engine
+from .database import BASE_DIR, DATABASE_URL, Base, engine, is_elevated, probe_data_dir
 
 SCHEMA_VERSION = 2
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
@@ -57,13 +57,27 @@ def backup_database() -> str:
     src_path = _sqlite_path()
     if not src_path or not os.path.exists(src_path):
         return ""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     dst_path = os.path.join(BACKUP_DIR, f"aurora_enterprise_{stamp}.db")
-    src = sqlite3.connect(src_path, timeout=30)
-    dst = sqlite3.connect(dst_path)
+    # 어느 단계에서 실패했는지 화면에 정확히 보이도록 단계별로 오류를 감싼다
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(f"백업 폴더 생성 실패: {BACKUP_DIR} ({e})") from e
+    try:
+        src = sqlite3.connect(src_path, timeout=30)
+        src.execute("PRAGMA schema_version").fetchone()
+    except sqlite3.Error as e:
+        raise RuntimeError(f"원본 DB 열기 실패: {src_path} ({e})") from e
+    try:
+        dst = sqlite3.connect(dst_path)
+    except sqlite3.Error as e:
+        src.close()
+        raise RuntimeError(f"백업 파일 생성 실패: {dst_path} ({e})") from e
     try:
         src.backup(dst)
+    except sqlite3.Error as e:
+        raise RuntimeError(f"백업 복사 실패: {src_path} → {dst_path} ({e})") from e
     finally:
         dst.close()
         src.close()
@@ -134,9 +148,22 @@ def migrate_schema() -> list[str]:
     return rebuilt
 
 
-def run_startup(post_steps) -> None:
-    """백업 → 마이그레이션 → 후처리(post_steps: [(phase, message, fn)]) 순서로 실행"""
+_run_lock = threading.Lock()
+
+
+def run_startup(post_steps, warning: str = "") -> None:
+    """백업 → 마이그레이션 → 후처리(post_steps: [(phase, message, fn)]) 순서로 실행 (재시도 가능)"""
+    if not _run_lock.acquire(blocking=False):
+        return
+    with _status_lock:
+        STATUS.update(ready=False, error="", steps=[], started_at=time.time(), finished_at=None)
     try:
+        if warning:
+            _set("check", warning)
+        _set("check", "데이터 폴더 접근 권한을 확인하고 있습니다...")
+        problem = probe_data_dir()
+        if problem:
+            raise RuntimeError(problem)
         _set("backup", "기존 DB를 백업하고 있습니다...")
         backup = backup_database()
         _set("backup", f"백업 완료: {os.path.basename(backup)}" if backup else "백업할 기존 DB가 없습니다 (신규 설치)",
@@ -155,10 +182,19 @@ def run_startup(post_steps) -> None:
             fn()
 
         _set("ready", "준비 완료", ready=True, finished_at=time.time())
-    except Exception as e:  # 실패 시 백업 파일로 복구할 수 있도록 경로를 안내
+    except Exception as e:  # 실패 원인과 조치 방법을 화면에 안내
+        hint = ""
+        if "unable to open" in str(e) or "denied" in str(e).lower() or "쓰기 불가" in str(e):
+            hint = (
+                " | 조치: 관리자 권한 명령 프롬프트에서 "
+                f'icacls "{BASE_DIR}" /reset /T /C 실행 후 [다시 시도]를 누르세요.'
+                + ("" if is_elevated() else " (현재 서버가 관리자 권한 없이 실행 중입니다)")
+            )
         _set(
             "error",
-            "DB 준비 중 오류가 발생했습니다. 백업 파일로 복구가 필요할 수 있습니다.",
-            error=str(e)[:500],
+            "DB 준비 중 오류가 발생했습니다.",
+            error=(str(e)[:450] + hint),
             finished_at=time.time(),
         )
+    finally:
+        _run_lock.release()

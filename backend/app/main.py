@@ -255,8 +255,12 @@ def _presence_worker():
             pass
 
 
+_DATA_DIR_WARNING = ""
+
+
 def _startup_sequence():
     run_startup(
+        warning=_DATA_DIR_WARNING,
         post_steps=[
             ("seed", "기본 배포 정책을 확인하는 중입니다...", init_default_data),
             ("cleanup", f"{RETENTION_DAYS}일이 지난 로그를 정리하는 중입니다...", cleanup_old_records),
@@ -337,7 +341,8 @@ def notify_ring_realtime(db: Session, ring: str, event_type: str = "policy"):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    secure_data_dir()
+    global _DATA_DIR_WARNING
+    _DATA_DIR_WARNING = secure_data_dir()
     accounts.init_accounts_db()
     threading.Thread(target=_startup_sequence, daemon=True).start()
     threading.Thread(target=_periodic_worker, daemon=True).start()
@@ -766,6 +771,18 @@ def system_status(_: dict = Depends(current_admin)):
     st = get_status()
     st["backup_file"] = os.path.basename(st.get("backup_file") or "")
     return st
+
+
+@app.post("/api/system/retry")
+def system_retry(_: dict = Depends(current_admin)):
+    """DB 준비 실패 시 로딩 화면의 [다시 시도] 버튼: 백업/마이그레이션을 처음부터 다시 실행"""
+    st = get_status()
+    if st["ready"]:
+        return {"ok": True, "ready": True}
+    if st["phase"] != "error":
+        raise HTTPException(status_code=409, detail="이미 진행 중입니다.")
+    threading.Thread(target=_startup_sequence, daemon=True).start()
+    return {"ok": True}
 
 
 @app.get("/api/access-logs", dependencies=ADMIN_DEPS)
