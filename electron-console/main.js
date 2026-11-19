@@ -27,6 +27,11 @@ const PORT = readServerPort();
 // 로그인 자동 시작(--minimized) 시에는 창을 띄우지 않고 트레이로 시작
 const START_MINIMIZED = process.argv.includes('--minimized') || process.argv.includes('--hidden');
 
+// 트레이 아이콘: assets/tray.png (+ tray@2x.png 고해상도). 파일이 없으면 아래 내장 아이콘 사용
+const TRAY_ICON_FILE = path.join(__dirname, 'assets', 'tray.png');
+const WINDOW_ICON_FILE = path.join(__dirname, 'build', 'icon.ico'); // 개발 모드용 (패키징 시에는 exe 아이콘 사용)
+const APP_TITLE = 'AURORA Endpoint Control Console';
+
 const TRAY_ICON_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgGJbgPxQzpKWl/WdkZGRgYmJigLJhGKwBiiHg6uvr/4eHh/+H8YEmwTQMDw8HYmJi/v/9+xeiB6YaWRjZALhiZANQxckGoIkTNYDUwR41gPgAAJ9/J+7S5Y1NAAAAAElFTkSuQmCC';
 
@@ -123,9 +128,10 @@ function runAutostartTask(action) {
 }
 
 function createTray() {
-  const icon = nativeImage.createFromDataURL(TRAY_ICON_DATA_URL);
+  let icon = fs.existsSync(TRAY_ICON_FILE) ? nativeImage.createFromPath(TRAY_ICON_FILE) : null;
+  if (!icon || icon.isEmpty()) icon = nativeImage.createFromDataURL(TRAY_ICON_DATA_URL);
   tray = new Tray(icon);
-  tray.setToolTip('AURORA Control Console (서버 가동 중)');
+  tray.setToolTip(`${APP_TITLE} (서버 가동 중)`);
 
   const menu = Menu.buildFromTemplate([
     {
@@ -145,7 +151,7 @@ function createTray() {
           type: 'warning',
           buttons: ['완전 종료', '취소'],
           defaultId: 1,
-          title: 'AURORA Control Console 종료',
+          title: `${APP_TITLE} 종료`,
           message: '관제 콘솔과 백그라운드 API 서버를 완전히 종료하시겠습니까?',
           detail: '서버가 종료되면 원격 PC 에이전트들이 상태를 보고할 수 없게 됩니다.',
         });
@@ -177,7 +183,8 @@ async function createWindow() {
     height: 940,
     backgroundColor: '#090d16',
     autoHideMenuBar: true,
-    title: 'AURORA Update Control',
+    title: 'AURORA Endpoint Control',
+    ...(fs.existsSync(WINDOW_ICON_FILE) ? { icon: WINDOW_ICON_FILE } : {}),
     show: !START_MINIMIZED,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -192,7 +199,7 @@ async function createWindow() {
       mainWindow.hide();
       if (tray) {
         tray.displayBalloon({
-          title: 'AURORA Control Console',
+          title: APP_TITLE,
           content: '백그라운드에서 관제 서버가 계속 가동 중입니다. 완전 종료는 트레이 아이콘 우클릭을 이용하세요.',
         });
       }

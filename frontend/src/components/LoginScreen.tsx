@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { LogIn } from 'lucide-react';
 import { apiFetch, errorMessage, setSession } from '../api';
 import { PasswordChangeForm } from './PasswordChangeForm';
+import logoUrl from '../assets/ac1.png';
 
 interface Props {
   /** 로그인(및 필요 시 최초 비밀번호 변경)까지 완료되면 호출 */
@@ -42,9 +43,9 @@ export const LoginScreen: React.FC<Props> = ({ onLoggedIn, forcePasswordChange, 
     <div className="login-wrap">
       <div className="glass-card login-card">
         <div className="brand-group" style={{ marginBottom: 22 }}>
-          <div className="brand-logo mono">AU</div>
+          <img src={logoUrl} className="brand-logo brand-logo-img" alt="AURORA" />
           <div>
-            <h1 className="brand-title">AURORA Update Control</h1>
+            <h1 className="brand-title">AURORA Endpoint Control</h1>
             <p className="brand-sub">엔터프라이즈 패치 및 에이전트 중앙 관제</p>
           </div>
         </div>

@@ -37,6 +37,7 @@ import { NotificationsPanel } from './components/NotificationsPanel';
 import { RejectedPcs } from './components/RejectedPcs';
 import { AccessLogPanel } from './components/AccessLogPanel';
 import { PasswordChangeForm } from './components/PasswordChangeForm';
+import logoUrl from './assets/ac1.png';
 
 type MenuKey =
   | 'dashboard'
@@ -324,7 +325,7 @@ const showToast = (msg: string) => {
     if (!ipc?.setAutoStart) {
       setAutoStart(checked);
       localStorage.setItem('aurora_autostart', String(checked));
-      showToast('브라우저에서는 자동 시작을 설정할 수 없습니다. AURORA Control Console 앱에서 설정하세요.');
+      showToast('브라우저에서는 자동 시작을 설정할 수 없습니다. AURORA Endpoint Control Console 앱에서 설정하세요.');
       return;
     }
     try {
@@ -482,8 +483,8 @@ const showToast = (msg: string) => {
   const actionLabels: Record<string, string> = {
     scan: '업데이트 스캔',
     install_all: '차단 외 업데이트 일괄 설치',
-    reboot: '원격 재부팅 (30초 후 재시작)',
-    shutdown: '원격 전원 종료 (30초 후 종료)',
+    reboot: '원격 재부팅',
+    shutdown: '원격 전원 종료',
   };
   const label = actionLabels[type] || type;
 
@@ -556,10 +557,10 @@ const showToast = (msg: string) => {
       {/* 좌측 고정 사이드바 메뉴 */}
       <aside className="sidebar">
         <div className="brand-group">
-          <div className="brand-logo mono">AU</div>
+          <img src={logoUrl} className="brand-logo brand-logo-img" alt="AURORA" />
           <div>
-            <h1 className="brand-title">AURORA Control</h1>
-            <p className="brand-sub">중앙 업데이트 관제</p>
+            <h1 className="brand-title">Endpoint Control</h1>
+            <p className="brand-sub">오로라 관제 콘솔</p>
           </div>
         </div>
 
@@ -1167,7 +1168,7 @@ const showToast = (msg: string) => {
                   현재 승인 대기 중인 PC가 없습니다.
                 </div>
                 <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-                  대상 PC에서 AURORA Update Agent 서비스를 시작하고 관제 서버 주소를 저장하면 이곳에 자동으로 표시됩니다.
+                  대상 PC에서 AURORA Endpoint Agent 서비스를 시작하고 관제 서버 주소를 저장하면 이곳에 자동으로 표시됩니다.
                 </div>
               </section>
             )}
@@ -1701,7 +1702,7 @@ const showToast = (msg: string) => {
               >
                 <div>
                   <div style={{ fontWeight: 700, fontSize: 13.5 }}>
-                    Windows 로그인 시 AURORA Control Console 자동 시작
+                    Windows 로그인 시 AURORA Endpoint Control Console 자동 시작
                   </div>
                   <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 3 }}>
                     서버 PC가 재부팅되어도 중앙 관제 서버와 백그라운드 API 엔진이 즉시 자동으로 가동됩니다.

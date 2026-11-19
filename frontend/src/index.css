@@ -149,6 +149,13 @@ body {
   flex-shrink: 0;
 }
 
+.brand-logo-img {
+  /* AC1 아이콘 이미지 로고 (frontend/src/assets/ac1.png) */
+  background: none;
+  object-fit: contain;
+  border-radius: 9px;
+}
+
 .brand-title {
   margin: 0;
   font-size: 16px;

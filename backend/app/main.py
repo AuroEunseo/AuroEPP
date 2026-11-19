@@ -348,7 +348,7 @@ async def lifespan(_: FastAPI):
     threading.Thread(target=_periodic_worker, daemon=True).start()
     threading.Thread(target=_presence_worker, daemon=True).start()
     print("=" * 60)
-    print("  AURORA Update Control Server 가동됨")
+    print("  AURORA Endpoint Control Server 가동됨")
     print(f"  주소: http://{SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}  (설정: server_config.json)")
     if os.path.exists(accounts.INITIAL_PASSWORD_FILE):
         print(f"  최초 관리자 계정 정보: {accounts.INITIAL_PASSWORD_FILE}")
@@ -356,7 +356,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="AURORA Update Control API", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="AURORA Endpoint Control API", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 app.add_middleware(
     CORSMiddleware,

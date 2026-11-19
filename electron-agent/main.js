@@ -13,7 +13,9 @@ const CONFIG_FILE = path.join(DATA_DIR, 'agent_config.json');
 const AGENT_LOG_FILE = path.join(DATA_DIR, 'logs', 'agent.log');
 const DEFAULT_SERVER_IP = '127.0.0.1';
 const DEFAULT_SERVER_PORT = 1557;
+// 작업 스케줄러 작업 이름은 제품명이 바뀌어도 유지 (기존 설치본과 같은 이름이어야 제거·업데이트 시 정리됨)
 const AUTOSTART_TASK = 'AURORA Update Agent Tray';
+const APP_TITLE = 'AURORA Endpoint Agent';
 
 // 로그인 자동 실행 인수: --minimized (작업 스케줄러 자동 시작 작업과 동일)
 // --tray / --hidden 은 이전 버전 설치본 호환용으로만 인식
@@ -316,7 +318,7 @@ function createTray() {
     .createFromDataURL(TRAY_ICON_DATA_URL)
     .resize({ width: 16, height: 16 });
   tray = new Tray(icon);
-  tray.setToolTip('AURORA Update Agent (백그라운드 상시 실행 중)');
+  tray.setToolTip(`${APP_TITLE} (백그라운드 상시 실행 중)`);
 
   const contextMenu = Menu.buildFromTemplate([
     {
@@ -342,7 +344,7 @@ function createTray() {
           type: 'warning',
           buttons: ['완전 종료', '취소'],
           defaultId: 1,
-          title: 'AURORA Agent 완전 종료',
+          title: `${APP_TITLE} 완전 종료`,
           message: '에이전트와 백그라운드 업데이트 서비스를 완전히 종료하시겠습니까?',
           detail: '종료 시 중앙 관제 서버에 종료 로그가 기록되며 원격 업데이트 제어가 중단됩니다.',
         });
@@ -366,7 +368,7 @@ function createStatusWindow(startHidden = false) {
     resizable: false,
     autoHideMenuBar: true,
     backgroundColor: '#090d16',
-    title: 'AURORA Update Agent 설정',
+    title: `${APP_TITLE} 설정`,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -380,7 +382,7 @@ function createStatusWindow(startHidden = false) {
       mainWindow.hide();
       if (tray) {
         tray.displayBalloon({
-          title: 'AURORA Update Agent',
+          title: APP_TITLE,
           content: '백그라운드 트레이에서 계속 실행 중입니다. 완전히 종료하려면 트레이 아이콘을 우클릭하세요.',
         });
       }

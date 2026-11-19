@@ -115,7 +115,7 @@ class RealtimeAgentRunner:
 
 class AuroraAgentService(win32serviceutil.ServiceFramework):
     _svc_name_ = "AuroraUpdateAgent"
-    _svc_display_name_ = "AURORA Update Control Agent"
+    _svc_display_name_ = "AURORA Endpoint Agent"
     _svc_description_ = "중앙 정책 및 Windows 업데이트 제어 에이전트 서비스"
 
     def __init__(self, args):
