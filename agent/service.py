@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 # PyInstaller 패키징 및 Windows 서비스(System32 CWD) 환경에서 worker 모듈 경로 보장
@@ -61,7 +62,6 @@ class RealtimeAgentRunner:
 
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
-        self.sync_lock = threading.Lock()
         self.worker = AgentWorker(stop_event)
 
     def _apply_dynamic_server_url(self):
@@ -73,34 +73,32 @@ class RealtimeAgentRunner:
             self.worker.config["server_url"] = base_url
 
     def trigger_immediate_sync(self):
-        """실시간 푸시 수신 시 대기 없이 즉시 정책/명령 동기화 실행"""
-        if not self.sync_lock.acquire(blocking=False):
-            return
+        """실시간 푸시 수신 시 대기 없이 즉시 정책/명령 동기화 요청.
+
+        실제 체크인은 AgentWorker 메인 루프가 수행하고, 여기서는 대기만 깨운다.
+        (여러 푸시가 몰려와도 체크인은 한 번으로 합쳐짐)
+        """
         try:
             self._apply_dynamic_server_url()
-            for method_name in ("sync_once", "step", "tick", "poll"):
-                fn = getattr(self.worker, method_name, None)
-                if callable(fn):
-                    fn()
-                    return
+            self.worker.sync_once()
         except Exception:
             pass
-        finally:
-            self.sync_lock.release()
 
     def _sse_listener_loop(self):
         """승인 후 관제 서버와 상시 SSE 스트림을 유지하며 정책/명령 하달 즉시 반영"""
+        backoff = 3.0
         while not self.stop_event.is_set():
             identity = load_identity()
             machine_id = identity.get("machine_id")
             agent_token = identity.get("agent_token")
 
-            if not machine_id or not agent_token:
-                self.stop_event.wait(2.0)
+            # 승인 전에는 스트림이 401로 거부되므로 연결 시도 자체를 하지 않음
+            if not machine_id or not agent_token or not getattr(self.worker, "approved", False):
+                self.stop_event.wait(5.0)
                 continue
 
             base_url = load_server_base_url()
-            stream_url = f"{base_url}/api/agent/stream?machine_id={machine_id}"
+            stream_url = f"{base_url}/api/agent/stream?machine_id={urllib.parse.quote(machine_id)}"
             req = urllib.request.Request(
                 stream_url,
                 headers={
@@ -109,16 +107,22 @@ class RealtimeAgentRunner:
                 },
             )
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                # 서버는 20초마다 keepalive를 보내므로 60초 무응답 시 끊긴 것으로 판단
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    backoff = 3.0
                     for raw_line in resp:
                         if self.stop_event.is_set():
                             break
                         line = raw_line.decode("utf-8", errors="ignore").strip()
+                        # 'connected' 포함 모든 data 이벤트에서 동기화 요청
+                        # (연결이 끊겨 있던 동안 놓친 변경분을 따라잡기 위함, ': keepalive'는 무시)
                         if line.startswith("data:"):
                             self.trigger_immediate_sync()
             except Exception:
-                # 승인 대기 중(401)이거나 네트워크 단절 시 3초 후 자동 재연결
-                self.stop_event.wait(3.0)
+                pass
+            # 단절/거부 시 지수 백오프(3s → 최대 60s)로 재연결, 서버 폭주 방지
+            self.stop_event.wait(backoff)
+            backoff = min(backoff * 2, 60.0)
 
     def run(self):
         self._apply_dynamic_server_url()

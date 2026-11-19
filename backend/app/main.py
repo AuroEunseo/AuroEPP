@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -12,6 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from .catalog_sync import sync_catalog_database
@@ -27,6 +29,12 @@ from .schemas import (
     RuleRequest,
 )
 from .security import ADMIN_TOKEN, hash_token, verify_admin, verify_agent
+
+
+# 기능 업데이트 고정 버전 기본값 (서비스 종료된 버전에 고정되지 않도록 환경변수로 지정 가능)
+DEFAULT_TARGET_RELEASE = os.getenv("AURORA_TARGET_RELEASE", "25H2").strip() or "25H2"
+# 기존 DB에 남아 있는 지원 종료 버전 기본값 → DEFAULT_TARGET_RELEASE 로 자동 전환
+LEGACY_TARGET_RELEASES = {"24H2"}
 
 
 def policy_hash(items: list) -> str:
@@ -60,7 +68,7 @@ def init_default_data():
                 {"path": wu, "name": "DeferQualityUpdatesPeriodInDays", "type": "DWORD", "value": days},
                 {"path": wu, "name": "ProductVersion", "type": "SZ", "value": "Windows 11"},
                 {"path": wu, "name": "TargetReleaseVersion", "type": "DWORD", "value": 1},
-                {"path": wu, "name": "TargetReleaseVersionInfo", "type": "SZ", "value": "24H2"},
+                {"path": wu, "name": "TargetReleaseVersionInfo", "type": "SZ", "value": DEFAULT_TARGET_RELEASE},
                 {"path": wu, "name": "ExcludeWUDriversInQualityUpdate", "type": "DWORD", "value": 1},
                 {"path": wu + "\\AU", "name": "NoAutoRebootWithLoggedOnUsers", "type": "DWORD", "value": 1},
             ]
@@ -68,6 +76,28 @@ def init_default_data():
         for ring_name, defer_days in (("ring0", 0), ("ring1", 7)):
             if not db.query(Policy).filter(Policy.ring == ring_name).first():
                 db.add(Policy(ring=ring_name, items_json=json.dumps(default_policy(defer_days))))
+
+        # 지원 종료된 버전(24H2 등)에 고정된 기존 정책을 기본 대상 버전으로 이관
+        # (의도적으로 유지하려면 AURORA_KEEP_TARGET_RELEASE=1 설정)
+        if os.getenv("AURORA_KEEP_TARGET_RELEASE", "0") != "1":
+            for pol in db.query(Policy).all():
+                items = json.loads(pol.items_json or "[]")
+                changed = False
+                for it in items:
+                    if (
+                        it.get("name") == "TargetReleaseVersionInfo"
+                        and str(it.get("value", "")).upper() in LEGACY_TARGET_RELEASES
+                        and str(it.get("value", "")).upper() != DEFAULT_TARGET_RELEASE.upper()
+                    ):
+                        old_val = it.get("value")
+                        it["value"] = DEFAULT_TARGET_RELEASE
+                        changed = True
+                if changed:
+                    pol.items_json = json.dumps(items, ensure_ascii=False)
+                    log_event(
+                        db, "server",
+                        f"{pol.ring} 정책의 고정 버전 {old_val} → {DEFAULT_TARGET_RELEASE} 자동 변경 (지원 종료 버전)",
+                    )
         db.commit()
     finally:
         db.close()
@@ -76,16 +106,42 @@ def init_default_data():
 # ==========================================
 # 실시간 에이전트 알림 스트림 큐 (SSE)
 # ==========================================
-AGENT_STREAMS: dict[str, asyncio.Queue] = {}
+# machine_id -> (이벤트 루프, 큐). 동기 API(스레드풀)에서도 안전하게 넣을 수 있도록 루프를 함께 보관
+AGENT_STREAMS: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = {}
+
+
+def _queue_put(q: asyncio.Queue, msg: dict):
+    try:
+        q.put_nowait(msg)
+    except asyncio.QueueFull:
+        # 에이전트는 이벤트 종류와 무관하게 '즉시 체크인'만 하므로 밀린 알림은 버려도 무방
+        pass
 
 
 def notify_agent_realtime(machine_id: str, event_type: str = "sync"):
-    q = AGENT_STREAMS.get(machine_id)
-    if q:
-        try:
-            q.put_nowait({"type": event_type, "ts": time.time()})
-        except asyncio.QueueFull:
-            pass
+    entry = AGENT_STREAMS.get(machine_id)
+    if not entry:
+        return
+    loop, q = entry
+    msg = {"type": event_type, "ts": time.time()}
+    try:
+        # 동기 엔드포인트는 스레드풀에서 실행되므로 이벤트 루프 스레드로 넘겨서 넣는다
+        loop.call_soon_threadsafe(_queue_put, q, msg)
+    except RuntimeError:
+        # 루프가 이미 종료된 경우
+        AGENT_STREAMS.pop(machine_id, None)
+
+
+def _verify_stream_agent(machine_id: str, raw_token: str) -> bool:
+    """짧은 세션으로 검증만 하고 즉시 반환 (스트림이 DB 연결을 붙잡지 않도록)"""
+    with SessionLocal() as db:
+        agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
+        return bool(
+            agent
+            and agent.status == "active"
+            and raw_token
+            and secrets.compare_digest(agent.token_hash, hash_token(raw_token))
+        )
 
 
 def notify_ring_realtime(db: Session, ring: str, event_type: str = "policy"):
@@ -248,15 +304,19 @@ def agent_checkin(
 async def agent_realtime_stream(
     machine_id: str,
     x_agent_token: str = Header(default=""),
-    db: Session = Depends(get_db),
 ):
-    """승인된 에이전트와 상시 연결되는 실시간 정책/명령 푸시 채널"""
-    agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
-    if not agent or agent.status != "active" or agent.token_hash != hash_token(x_agent_token):
+    """승인된 에이전트와 상시 연결되는 실시간 정책/명령 푸시 채널
+
+    - DB 세션은 인증 확인에만 잠깐 쓰고 반환한다. (기존: 스트림 수명 동안 커넥션 점유 →
+      연결 PC가 풀 크기(기본 15)를 넘으면 체크인 API가 멈추는 문제)
+    - 동기 DB 조회는 스레드풀에서 실행해 이벤트 루프를 막지 않는다.
+    """
+    ok = await run_in_threadpool(_verify_stream_agent, machine_id, x_agent_token)
+    if not ok:
         raise HTTPException(status_code=401, detail="미승인 또는 유효하지 않은 에이전트 토큰")
 
-    q: asyncio.Queue = asyncio.Queue(maxsize=32)
-    AGENT_STREAMS[machine_id] = q
+    q: asyncio.Queue = asyncio.Queue(maxsize=8)
+    AGENT_STREAMS[machine_id] = (asyncio.get_running_loop(), q)
 
     async def event_generator():
         try:
@@ -268,7 +328,8 @@ async def agent_realtime_stream(
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
         finally:
-            if AGENT_STREAMS.get(machine_id) is q:
+            entry = AGENT_STREAMS.get(machine_id)
+            if entry and entry[1] is q:
                 AGENT_STREAMS.pop(machine_id, None)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -344,14 +405,27 @@ def get_dashboard_state(db: Session = Depends(get_db)):
 
     # 수집된 Windows 11 업데이트 카탈로그 + 사내 설치/대기 대수 집계
     catalog_rows = db.query(UpdateCatalog).order_by(UpdateCatalog.updated_at.desc()).limit(100).all()
+
+    # PC별 설치 완료/대기 KB 집합을 한 번만 계산
+    # - 설치: hotfix 목록(길이 제한 없음) + 이력 중 설치 성공(op=1, rc=2/3) 항목
+    # - 정확히 일치하는 KB만 집계 (기존 부분 문자열 비교로 인한 오집계 제거)
+    installed_sets: list[set[str]] = []
+    pending_sets: list[set[str]] = []
+    for a in raw_active:
+        inst = {t.strip().upper() for t in (a.hotfix or "").split(",") if t.strip()}
+        for h in json.loads(a.hist_json or "[]"):
+            if h.get("kb") and h.get("op") == 1 and h.get("rc") in (2, 3):
+                inst.add(str(h["kb"]).upper())
+        installed_sets.append(inst)
+        pending_sets.append(
+            {str(u.get("kb") or "").upper() for u in json.loads(a.pend_json or "[]") if u.get("kb")}
+        )
+
     catalog_list = []
     for c in catalog_rows:
-        installed_cnt = sum(1 for a in raw_active if c.kb in (a.hotfix or "").upper())
-        pending_cnt = sum(
-            1
-            for a in raw_active
-            if any((u.get("kb") or "").upper() == c.kb for u in json.loads(a.pend_json or "[]"))
-        )
+        kb = (c.kb or "").upper()
+        installed_cnt = sum(1 for s_ in installed_sets if kb in s_)
+        pending_cnt = sum(1 for s_ in pending_sets if kb in s_)
         catalog_list.append({
             "kb": c.kb,
             "title": c.title,
@@ -371,6 +445,7 @@ def get_dashboard_state(db: Session = Depends(get_db)):
         "rules": rules,
         "events": events,
         "catalog": catalog_list,
+        "defaults": {"target_release": DEFAULT_TARGET_RELEASE},
     }
 
 
@@ -412,6 +487,7 @@ def revoke_agent_token(machine_id: str, db: Session = Depends(get_db)):
     agent.token_hash = "REVOKED"
     log_event(db, "console", f"토큰 폐기 및 재인증 대기 전환: {agent.hostname}")
     db.commit()
+    AGENT_STREAMS.pop(machine_id, None)
     return {"ok": True}
 
 
@@ -536,7 +612,7 @@ def manage_kb_rule(req: RuleRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/commands", dependencies=[Depends(verify_admin)])
 def dispatch_commands(req: CommandRequest, db: Session = Depends(get_db)):
-    valid_types = {"scan", "install_all", "install_kb", "hide_kb", "unhide_kb", "reboot"}
+    valid_types = {"scan", "install_all", "install_kb", "hide_kb", "unhide_kb", "reboot", "shutdown"}
     if req.type not in valid_types:
         raise HTTPException(status_code=400, detail="지원하지 않는 명령 유형입니다.")
 

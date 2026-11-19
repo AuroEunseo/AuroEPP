@@ -9,6 +9,8 @@ let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 const PORT = 8080;
+// 로그인 자동 시작(--minimized) 시에는 창을 띄우지 않고 트레이로 시작
+const START_MINIMIZED = process.argv.includes('--minimized') || process.argv.includes('--hidden');
 
 const TRAY_ICON_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgGJbgPxQzpKWl/WdkZGRgYmJigLJhGKwBiiHg6uvr/4eHh/+H8YEmwTQMDw8HYmJi/v/9+xeiB6YaWRjZALhiZANQxckGoIkTNYDUwR41gPgAAJ9/J+7S5Y1NAAAAAElFTkSuQmCC';
@@ -115,7 +117,9 @@ async function createWindow() {
     backgroundColor: '#090d16',
     autoHideMenuBar: true,
     title: 'AURORA Update Control',
+    show: !START_MINIMIZED,
     webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
     },
@@ -163,18 +167,24 @@ if (!gotLock) {
     }
   });
 
-  ipcMain.handle('get-console-prefs', () => {
-  const settings = app.getLoginItemSettings();
-  return { openAtLogin: settings.openAtLogin };
-});
+  // 콘솔 자동 시작 설정 (preload.js의 consoleApi를 통해 웹 UI에서 호출)
+  // 로그인 자동 시작 시에는 창 없이 트레이로 시작하도록 --minimized 인수를 함께 등록
+  const LOGIN_ITEM = { path: process.execPath, args: ['--minimized'] };
 
-ipcMain.handle('set-console-autostart', (_e, enable) => {
-  app.setLoginItemSettings({
-    openAtLogin: Boolean(enable),
-    path: process.execPath,
+  ipcMain.handle('get-console-prefs', () => {
+    const settings = app.getLoginItemSettings(LOGIN_ITEM);
+    return { openAtLogin: Boolean(settings.openAtLogin) };
   });
-  return { ok: true, openAtLogin: Boolean(enable) };
-});
+
+  ipcMain.handle('set-console-autostart', (_e, enable) => {
+    if (!app.isPackaged) {
+      // 개발 모드(electron .)에서는 electron.exe가 등록되므로 실제 반영하지 않음
+      return { ok: false, openAtLogin: false, message: '개발 모드에서는 자동 시작을 설정할 수 없습니다.' };
+    }
+    app.setLoginItemSettings({ ...LOGIN_ITEM, openAtLogin: Boolean(enable) });
+    const applied = Boolean(app.getLoginItemSettings(LOGIN_ITEM).openAtLogin);
+    return { ok: applied === Boolean(enable), openAtLogin: applied };
+  });
 
   app.whenReady().then(() => {
     createTray();

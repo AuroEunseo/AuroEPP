@@ -36,6 +36,9 @@ class AgentWorker:
         self.global_rules: list[dict] = []
         self.pending_report: dict | None = None
         self.cmd_results: list[dict] = []
+        # SSE 푸시 수신 시 체크인 대기를 즉시 깨우기 위한 이벤트
+        self.wake_event = threading.Event()
+        self.approved = False
 
     def _bg_worker(self):
         while not self.stop_event.is_set():
@@ -64,7 +67,7 @@ class AgentWorker:
                     for h in scan_data.get("hist", [])
                     if h.get("op") == 1 and h.get("rc") in (2, 3) and h.get("kb")
                 ]
-                hotfix_str = ",".join(dict.fromkeys(done_kbs))[:100]
+                hotfix_str = ",".join(dict.fromkeys(done_kbs))
 
                 with self.lock:
                     self.pending_report = {
@@ -79,6 +82,8 @@ class AgentWorker:
                     self.cmd_results.append({"type": kind, "ok": False, "out": str(e)[:250]})
             finally:
                 self.busy.clear()
+                # 스캔/설치 결과를 다음 주기까지 기다리지 않고 즉시 보고
+                self.wake_event.set()
 
     def get_hardware_specs(self) -> dict:
         # 1. MAC address (XX:XX:XX:XX:XX:XX)
@@ -128,13 +133,71 @@ class AgentWorker:
         if kind != "sync" or (not self.busy.is_set() and self.job_queue.empty()):
             self.job_queue.put({"kind": kind, "rules": rules or []})
 
+    # ------------------------------------------------------------------
+    # 실시간 푸시(SSE) 연동
+    # ------------------------------------------------------------------
+    def sync_once(self):
+        """SSE 푸시 수신 시 호출: 메인 루프의 대기를 깨워 즉시 체크인하도록 요청.
+
+        체크인 자체는 항상 메인 루프 스레드에서만 수행되므로 applied_hash 등
+        상태값을 두 스레드가 동시에 건드리는 경쟁 조건이 생기지 않는다.
+        """
+        self.wake_event.set()
+
+    def _wait(self, timeout: float):
+        """timeout 동안 대기하되 서비스 중지 또는 즉시 동기화 요청 시 바로 깨어남"""
+        deadline = time.time() + timeout
+        while not self.stop_event.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            if self.wake_event.wait(min(1.0, remaining)):
+                break
+        self.wake_event.clear()
+
+    def _run_command(self, cmd: dict):
+        ctype = cmd.get("type")
+        cpayload = cmd.get("payload") or {}
+        kb = cpayload.get("kb", "")
+
+        if ctype == "scan":
+            self._enqueue_job("sync")
+        elif ctype == "install_all":
+            self._enqueue_job("install_all")
+        elif ctype == "install_kb" and kb:
+            self._enqueue_job("single_kb", [{"kb": kb, "action": "install"}])
+        elif ctype == "hide_kb" and kb:
+            self._enqueue_job("single_kb", [{"kb": kb, "action": "block"}])
+        elif ctype == "unhide_kb" and kb:
+            self._enqueue_job("single_kb", [{"kb": kb, "action": "allow"}])
+        elif ctype in ("reboot", "shutdown"):
+            flag, verb, label = (
+                ("/r", "Rebooting", "Reboot") if ctype == "reboot" else ("/s", "Shutting down", "Shutdown")
+            )
+            try:
+                subprocess.run(
+                    ["shutdown", flag, "/t", "30", "/c", f"AURORA: {verb} in 30 seconds by admin request."],
+                    creationflags=NOWIN,
+                    check=True,
+                )
+                result = {"type": ctype, "ok": True, "out": f"{label} scheduled in 30s"}
+            except Exception as e:
+                result = {"type": ctype, "ok": False, "out": str(e)[:250]}
+            with self.lock:
+                self.cmd_results.append(result)
+        else:
+            with self.lock:
+                self.cmd_results.append({"type": str(ctype), "ok": False, "out": "Unsupported command"})
+
     def run(self):
         threading.Thread(target=self._bg_worker, daemon=True).start()
         hw_specs = self.get_hardware_specs()
 
         while not self.stop_event.is_set():
             # Step 1: Wait for admin approval in console
-            ident = wait_for_approval(self.server_url, AGENT_VER, self.stop_event)
+            self.approved = False
+            ident = wait_for_approval(self.server_url, AGENT_VER, self.stop_event, wait_fn=self._wait)
+            self.approved = True
 
             applied_hash = ""
             seen_rules_hash = None
@@ -192,41 +255,7 @@ class AgentWorker:
 
                     # Process server commands
                     for cmd in res.get("commands", []):
-                        ctype = cmd.get("type")
-                        cpayload = cmd.get("payload", {})
-                        kb = cpayload.get("kb", "")
-
-                        elif ctype == "reboot":
-                        subprocess.run(
-                            ["shutdown", "/r", "/t", "30", "/c", "AURORA: Rebooting in 30 seconds by admin request."],
-                            creationflags=NOWIN,
-                        )
-                        with self.lock:
-                            self.cmd_results.append({"type": "reboot", "ok": True, "out": "Reboot scheduled in 30s"})
-                        elif ctype == "shutdown":
-                        subprocess.run(
-                        ["shutdown", "/s", "/t", "30", "/c", "AURORA: Shutting down in 30 seconds by admin request."],
-                        creationflags=NOWIN,
-                    )
-                    with self.lock:
-                        self.cmd_results.append({"type": "shutdown", "ok": True, "out": "Shutdown scheduled in 30s"})
-                        if ctype == "scan":
-                            self._enqueue_job("sync")
-                        elif ctype == "install_all":
-                            self._enqueue_job("install_all")
-                        elif ctype == "install_kb" and kb:
-                            self._enqueue_job("single_kb", [{"kb": kb, "action": "install"}])
-                        elif ctype == "hide_kb" and kb:
-                            self._enqueue_job("single_kb", [{"kb": kb, "action": "block"}])
-                        elif ctype == "unhide_kb" and kb:
-                            self._enqueue_job("single_kb", [{"kb": kb, "action": "allow"}])
-                        elif ctype == "reboot":
-                            subprocess.run(
-                                ["shutdown", "/r", "/t", "30", "/c", "AURORA: Rebooting in 30 seconds by admin request."],
-                                creationflags=NOWIN,
-                            )
-                            with self.lock:
-                                self.cmd_results.append({"type": "reboot", "ok": True, "out": "Reboot scheduled in 30s"})
+                        self._run_command(cmd)
 
                     # Sync update list on rule change or periodic interval
                     if res.get("rules_hash") != seen_rules_hash or (time.time() - last_scan_ts > AUTO_SCAN_INTERVAL):
@@ -255,4 +284,4 @@ class AgentWorker:
                 except Exception:
                     pass
 
-                self.stop_event.wait(CHECKIN_INTERVAL)
+                self._wait(CHECKIN_INTERVAL)

@@ -89,4 +89,5 @@ export interface CatalogItem {
 export interface DashboardState {
   // ... 기존 필드들 (agents, policies, kb_rules, events 등) 유지 ...
   catalog?: CatalogItem[];
+  defaults?: { target_release: string };
 }

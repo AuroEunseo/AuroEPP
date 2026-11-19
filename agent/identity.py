@@ -74,8 +74,12 @@ def get_or_create_identity(force_new_token: bool = False) -> dict:
     return ident
 
 
-def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None) -> dict:
-    """서버에 토큰·PC이름·OS버전을 등록하고 콘솔 관리자가 승인할 때까지 대기"""
+def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None, wait_fn=None) -> dict:
+    """서버에 토큰·PC이름·OS버전을 등록하고 콘솔 관리자가 승인할 때까지 대기
+
+    wait_fn: 대기 함수(초 단위). 지정 시 서비스 중지/즉시 동기화 요청에 바로 반응한다.
+    """
+    sleep = wait_fn or time.sleep
     ident = get_or_create_identity()
 
     while True:
@@ -105,9 +109,9 @@ def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None) 
         except urllib.error.HTTPError as e:
             if e.code == 403:
                 # 거부된 경우 60초 후 재시도
-                time.sleep(60)
+                sleep(60)
                 continue
         except Exception:
             pass
 
-        time.sleep(15)
+        sleep(15)

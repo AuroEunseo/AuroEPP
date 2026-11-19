@@ -27,6 +27,7 @@ import {
   Network,
   LogOut,
   ArrowUpRight,
+  Power,
 } from 'lucide-react';
 import { DashboardState, Agent } from './types';
 import { apiFetch, getAdminToken, setAdminToken } from './api';
@@ -82,7 +83,7 @@ const REGISTRY_BLOCKS: PolicyBlockDef[] = [
   {
     id: 'target_version',
     title: 'Windows 기능 업데이트 버전 고정',
-    desc: '상위 메이저 OS 버전으로 자동 업그레이드되는 것을 차단하고 지정된 빌드(예: 24H2)로 고정합니다.',
+    desc: '상위 메이저 OS 버전으로 자동 업그레이드되는 것을 차단하고 지정된 빌드(예: 25H2)로 고정합니다. 지원 종료된 버전에 고정하면 보안 업데이트를 받지 못합니다.',
     path: WU,
     name: 'TargetReleaseVersion',
     type: 'DWORD',
@@ -279,12 +280,35 @@ const showToast = (msg: string) => {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const toggleAutoStart = (checked: boolean) => {
-    setAutoStart(checked);
-    localStorage.setItem('aurora_autostart', String(checked));
-    const ipc = (window as any).electronAPI || (window as any).consoleApi;
-    if (ipc?.setAutoStart) {
-      ipc.setAutoStart(checked);
+  // Electron 콘솔(preload의 consoleApi)에서 실제 Windows 로그인 항목 상태를 읽어와 동기화
+  useEffect(() => {
+    const ipc = (window as any).consoleApi;
+    if (!ipc?.getPrefs) return;
+    ipc
+      .getPrefs()
+      .then((p: { openAtLogin: boolean }) => {
+        setAutoStart(Boolean(p?.openAtLogin));
+        localStorage.setItem('aurora_autostart', String(Boolean(p?.openAtLogin)));
+      })
+      .catch(() => {});
+  }, []);
+
+  const toggleAutoStart = async (checked: boolean) => {
+    const ipc = (window as any).consoleApi;
+    if (!ipc?.setAutoStart) {
+      setAutoStart(checked);
+      localStorage.setItem('aurora_autostart', String(checked));
+      showToast('브라우저에서는 자동 시작을 설정할 수 없습니다. AURORA Control Console 앱에서 설정하세요.');
+      return;
+    }
+    try {
+      const res = await ipc.setAutoStart(checked);
+      const applied = Boolean(res?.openAtLogin);
+      setAutoStart(applied);
+      localStorage.setItem('aurora_autostart', String(applied));
+      showToast(applied ? '✓ Windows 로그인 시 자동 시작이 설정되었습니다.' : '✓ 자동 시작이 해제되었습니다.');
+    } catch (e: any) {
+      showToast(`자동 시작 설정 실패: ${e?.message || e}`);
     }
   };
 
@@ -363,6 +387,9 @@ const showToast = (msg: string) => {
     });
   };
 
+  // 서버가 내려주는 기능 업데이트 고정 버전 기본값 (AURORA_TARGET_RELEASE)
+  const defaultTargetRelease = state?.defaults?.target_release || '25H2';
+
   const toggleBlock = (blk: PolicyBlockDef, enable: boolean) => {
     setItemValue(blk.path, blk.name, blk.type, enable ? blk.enabledValue : blk.disabledValue);
     if (enable && blk.hasParam === 'days' && getItemValue(blk.path, blk.paramName!) === undefined) {
@@ -371,7 +398,7 @@ const showToast = (msg: string) => {
     if (enable && blk.hasParam === 'version') {
       setItemValue(blk.path, 'ProductVersion', 'SZ', 'Windows 11');
       if (!getItemValue(blk.path, blk.paramName!)) {
-        setItemValue(blk.path, blk.paramName!, 'SZ', '24H2');
+        setItemValue(blk.path, blk.paramName!, 'SZ', defaultTargetRelease);
       }
     }
   };
@@ -850,6 +877,9 @@ const showToast = (msg: string) => {
                 <button onClick={() => sendBatchCmd('reboot')} className="btn btn-amber">
                   <RotateCcw size={13} /> 선택 재부팅 (30초)
                 </button>
+                <button onClick={() => sendBatchCmd('shutdown')} className="btn btn-amber">
+                  <Power size={13} /> 선택 전원 종료 (30초)
+                </button>
               </div>
             </div>
 
@@ -1212,12 +1242,12 @@ const showToast = (msg: string) => {
                           <span>목표 빌드 버전:</span>
                           <input
                             type="text"
-                            value={String(getItemValue(blk.path, blk.paramName!) ?? '24H2')}
+                            value={String(getItemValue(blk.path, blk.paramName!) ?? defaultTargetRelease)}
                             onChange={(e) => {
                               setItemValue(blk.path, 'ProductVersion', 'SZ', 'Windows 11');
                               setItemValue(blk.path, blk.paramName!, 'SZ', e.target.value.trim());
                             }}
-                            placeholder="예: 24H2"
+                            placeholder={`예: ${defaultTargetRelease}`}
                             className="input-dark mono"
                             style={{ width: 110 }}
                           />

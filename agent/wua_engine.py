@@ -74,7 +74,8 @@ $p = @($q.Search('IsInstalled=0').Updates | ForEach-Object {
         cat   = ((@($_.Categories) | ForEach-Object {$_.Name}) -join ',')
     }
 })
-$h = @($q.QueryHistory(0, 40) | ForEach-Object {
+$hc = [int]$q.GetTotalHistoryCount()
+$h = @($q.QueryHistory(0, $hc) | ForEach-Object {
     [pscustomobject]@{
         id    = $_.UpdateIdentity.UpdateID
         title = [string]$_.Title

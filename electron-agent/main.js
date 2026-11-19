@@ -9,9 +9,10 @@ const DATA_DIR = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA
 const IDENTITY_FILE = path.join(DATA_DIR, 'identity.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'agent_config.json');
 
-// --minimized / --hidden 인수로 부팅 자동 실행될 때만 트레이로 숨김 시작
-const START_MINIMIZED =
-  process.argv.includes('--minimized') || process.argv.includes('--hidden');
+// 로그인 자동 실행 인수: --minimized (설치 파일 installer.nsh의 Run 레지스트리와 동일)
+// --tray / --hidden 은 이전 버전 설치본 호환용으로만 인식
+const STARTUP_ARG = '--minimized';
+const START_MINIMIZED = [STARTUP_ARG, '--tray', '--hidden'].some((a) => process.argv.includes(a));
 
 let mainWindow = null;
 let tray = null;
@@ -97,14 +98,14 @@ function ensureBootPersistenceAndReconnect() {
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaultCfg, null, 2), 'utf8');
   }
 
-  // 2. Windows 로그인 시 에이전트 트레이 UI 자동 시작 등록 (--minimized)
+  // 2. 로그인 자동 실행은 설치 파일이 HKLM Run(모든 사용자, --minimized)으로 등록한다.
+  //    이전 버전이 사용자별(HKCU)로 중복 등록한 항목은 정리하여 트레이가 두 번 뜨지 않도록 한다.
   if (app.isPackaged) {
     try {
-      app.setLoginItemSettings({
-        openAtLogin: true,
-        path: process.execPath,
-        args: ['--minimized'],
-      });
+      const legacy = { path: process.execPath, args: [STARTUP_ARG] };
+      if (app.getLoginItemSettings(legacy).openAtLogin) {
+        app.setLoginItemSettings({ ...legacy, openAtLogin: false });
+      }
     } catch (e) {}
   }
 

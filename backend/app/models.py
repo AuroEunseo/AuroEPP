@@ -26,7 +26,7 @@ class Agent(Base):
     last_seen = Column(Float, default=time.time)
     applied_hash = Column(String(32), default="")
     reboot_required = Column(Boolean, default=False)
-    hotfix = Column(String(128), default="")
+    hotfix = Column(Text, default="")  # 설치 KB 목록 (길이 제한 없음)
     agent_ver = Column(String(32), default="1.0")
     
     pend_json = Column(Text, default="[]")
@@ -42,7 +42,7 @@ class AgentCommand(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     machine_id = Column(String(64), ForeignKey("agents.machine_id", ondelete="CASCADE"), index=True)
-    cmd_type = Column(String(32), nullable=False)  # scan, install_all, install_kb, hide_kb, unhide_kb, reboot
+    cmd_type = Column(String(32), nullable=False)  # scan, install_all, install_kb, hide_kb, unhide_kb, reboot, shutdown
     mac_addr = Column(String, default="")
     cpu_info = Column(String, default="")
     ram_gb = Column(String, default="")
