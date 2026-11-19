@@ -1193,6 +1193,7 @@ imported by:
  &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric.x25519">cryptography.hazmat.primitives.asymmetric.x25519</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric.x448">cryptography.hazmat.primitives.asymmetric.x448</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers">cryptography.hazmat.primitives.ciphers</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.aead">cryptography.hazmat.primitives.ciphers.aead</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.algorithms">cryptography.hazmat.primitives.ciphers.algorithms</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.base">cryptography.hazmat.primitives.ciphers.base</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.modes">cryptography.hazmat.primitives.ciphers.modes</a>
@@ -5195,6 +5196,8 @@ imported by:
 <span class="moduletype">NamespacePackage</span>  <div class="import">
 imports:
     <a href="#app">app</a>
+ &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
 
   </div>
   <div class="import">
@@ -5203,9 +5206,11 @@ imported by:
  &#8226;   <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.catalog_sync">app.catalog_sync</a>
  &#8226;   <a href="#app.database">app.database</a>
+ &#8226;   <a href="#app.keystore">app.keystore</a>
  &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#app.migrations">app.migrations</a>
  &#8226;   <a href="#app.models">app.models</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.schemas">app.schemas</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#app.settings">app.settings</a>
@@ -5221,12 +5226,18 @@ imported by:
 imports:
     <a href="#app">app</a>
  &#8226;   <a href="#app.database">app.database</a>
+ &#8226;   <a href="#app.keystore">app.keystore</a>
  &#8226;   <a href="#app.settings">app.settings</a>
+ &#8226;   <a href="#base64">base64</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.aead">cryptography.hazmat.primitives.ciphers.aead</a>
  &#8226;   <a href="#hashlib">hashlib</a>
  &#8226;   <a href="#hmac">hmac</a>
+ &#8226;   <a href="#json">json</a>
  &#8226;   <a href="#os">os</a>
+ &#8226;   <a href="#re">re</a>
  &#8226;   <a href="#secrets">secrets</a>
  &#8226;   <a href="#sqlite3">sqlite3</a>
+ &#8226;   <a href="#sys">sys</a>
  &#8226;   <a href="#threading">threading</a>
  &#8226;   <a href="#time">time</a>
 
@@ -5287,8 +5298,29 @@ imported by:
  &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#app.migrations">app.migrations</a>
  &#8226;   <a href="#app.models">app.models</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#app.settings">app.settings</a>
+
+  </div>
+
+</div>
+
+<div class="node">
+  <a name="app.keystore"></a>
+  <a target="code" href="///C:/Users/%EA%B9%80%EC%9D%80%EC%84%9C/Desktop/Project_etc/PC_Agent/backend/app/keystore.py" type="text/plain"><tt>app.keystore</tt></a>
+<span class="moduletype">SourceModule</span>  <div class="import">
+imports:
+    <a href="#app">app</a>
+ &#8226;   <a href="#ctypes">ctypes</a>
+ &#8226;   <a href="#os">os</a>
+ &#8226;   <a href="#sys">sys</a>
+
+  </div>
+  <div class="import">
+imported by:
+    <a href="#app.accounts">app.accounts</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
 
   </div>
 
@@ -5305,6 +5337,7 @@ imports:
  &#8226;   <a href="#app.database">app.database</a>
  &#8226;   <a href="#app.migrations">app.migrations</a>
  &#8226;   <a href="#app.models">app.models</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.schemas">app.schemas</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#app.settings">app.settings</a>
@@ -5319,6 +5352,7 @@ imports:
  &#8226;   <a href="#os">os</a>
  &#8226;   <a href="#re">re</a>
  &#8226;   <a href="#secrets">secrets</a>
+ &#8226;   <a href="#sqlalchemy">sqlalchemy</a>
  &#8226;   <a href="#sqlalchemy.orm">sqlalchemy.orm</a>
  &#8226;   <a href="#starlette.concurrency">starlette.concurrency</a>
  &#8226;   <a href="#sys">sys</a>
@@ -5328,7 +5362,9 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#server_entry.py">server_entry.py</a>
+    <a href="#app">app</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
+ &#8226;   <a href="#server_entry.py">server_entry.py</a>
 
   </div>
 
@@ -5376,7 +5412,47 @@ imports:
 imported by:
     <a href="#app.catalog_sync">app.catalog_sync</a>
  &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.security">app.security</a>
+
+  </div>
+
+</div>
+
+<div class="node">
+  <a name="app.packages"></a>
+  <a target="code" href="///C:/Users/%EA%B9%80%EC%9D%80%EC%84%9C/Desktop/Project_etc/PC_Agent/backend/app/packages.py" type="text/plain"><tt>app.packages</tt></a>
+<span class="moduletype">SourceModule</span>  <div class="import">
+imports:
+    <a href="#app">app</a>
+ &#8226;   <a href="#app.database">app.database</a>
+ &#8226;   <a href="#app.keystore">app.keystore</a>
+ &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.models">app.models</a>
+ &#8226;   <a href="#app.schemas">app.schemas</a>
+ &#8226;   <a href="#app.security">app.security</a>
+ &#8226;   <a href="#app.settings">app.settings</a>
+ &#8226;   <a href="#base64">base64</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric.ed25519">cryptography.hazmat.primitives.asymmetric.ed25519</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.serialization">cryptography.hazmat.primitives.serialization</a>
+ &#8226;   <a href="#fastapi">fastapi</a>
+ &#8226;   <a href="#fastapi.responses">fastapi.responses</a>
+ &#8226;   <a href="#hashlib">hashlib</a>
+ &#8226;   <a href="#json">json</a>
+ &#8226;   <a href="#os">os</a>
+ &#8226;   <a href="#re">re</a>
+ &#8226;   <a href="#secrets">secrets</a>
+ &#8226;   <a href="#shutil">shutil</a>
+ &#8226;   <a href="#sqlalchemy.orm">sqlalchemy.orm</a>
+ &#8226;   <a href="#threading">threading</a>
+ &#8226;   <a href="#time">time</a>
+ &#8226;   <a href="#urllib.parse">urllib.parse</a>
+
+  </div>
+  <div class="import">
+imported by:
+    <a href="#app">app</a>
+ &#8226;   <a href="#app.main">app.main</a>
 
   </div>
 
@@ -5396,6 +5472,7 @@ imports:
   <div class="import">
 imported by:
     <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
 
   </div>
 
@@ -5421,6 +5498,7 @@ imports:
   <div class="import">
 imported by:
     <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
 
   </div>
 
@@ -5442,6 +5520,7 @@ imports:
 imported by:
     <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#server_entry.py">server_entry.py</a>
 
@@ -6633,7 +6712,9 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#email._encoded_words">email._encoded_words</a>
+    <a href="#app.accounts">app.accounts</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
+ &#8226;   <a href="#email._encoded_words">email._encoded_words</a>
  &#8226;   <a href="#email.base64mime">email.base64mime</a>
  &#8226;   <a href="#email.encoders">email.encoders</a>
  &#8226;   <a href="#encodings.base64_codec">encodings.base64_codec</a>
@@ -8536,6 +8617,7 @@ imported by:
  &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric.utils">cryptography.hazmat.primitives.asymmetric.utils</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric.x25519">cryptography.hazmat.primitives.asymmetric.x25519</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric.x448">cryptography.hazmat.primitives.asymmetric.x448</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.aead">cryptography.hazmat.primitives.ciphers.aead</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.base">cryptography.hazmat.primitives.ciphers.base</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.hashes">cryptography.hazmat.primitives.hashes</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.serialization.base">cryptography.hazmat.primitives.serialization.base</a>
@@ -8985,7 +9067,8 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#cryptography.hazmat.primitives.asymmetric">cryptography.hazmat.primitives.asymmetric</a>
+    <a href="#app.packages">app.packages</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric">cryptography.hazmat.primitives.asymmetric</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.asymmetric.types">cryptography.hazmat.primitives.asymmetric.types</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.serialization.ssh">cryptography.hazmat.primitives.serialization.ssh</a>
  &#8226;   <a href="#cryptography.x509.base">cryptography.x509.base</a>
@@ -9250,10 +9333,29 @@ imports:
   <div class="import">
 imported by:
     <a href="#cryptography.hazmat.backends.openssl.backend">cryptography.hazmat.backends.openssl.backend</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.aead">cryptography.hazmat.primitives.ciphers.aead</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.algorithms">cryptography.hazmat.primitives.ciphers.algorithms</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.base">cryptography.hazmat.primitives.ciphers.base</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.ciphers.modes">cryptography.hazmat.primitives.ciphers.modes</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.serialization.ssh">cryptography.hazmat.primitives.serialization.ssh</a>
+
+  </div>
+
+</div>
+
+<div class="node">
+  <a name="cryptography.hazmat.primitives.ciphers.aead"></a>
+  <a target="code" href="///C:/Users/%EA%B9%80%EC%9D%80%EC%84%9C/AppData/Local/Programs/Python/Python314/Lib/site-packages/cryptography/hazmat/primitives/ciphers/aead.py" type="text/plain"><tt>cryptography.hazmat.primitives.ciphers.aead</tt></a>
+<span class="moduletype">SourceModule</span>  <div class="import">
+imports:
+    <a href="#__future__">__future__</a>
+ &#8226;   <a href="#cryptography.hazmat.bindings._rust">cryptography.hazmat.bindings._rust</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives.ciphers">cryptography.hazmat.primitives.ciphers</a>
+
+  </div>
+  <div class="import">
+imported by:
+    <a href="#app.accounts">app.accounts</a>
 
   </div>
 
@@ -9400,7 +9502,8 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#cryptography.hazmat.primitives">cryptography.hazmat.primitives</a>
+    <a href="#app.packages">app.packages</a>
+ &#8226;   <a href="#cryptography.hazmat.primitives">cryptography.hazmat.primitives</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.serialization.base">cryptography.hazmat.primitives.serialization.base</a>
  &#8226;   <a href="#cryptography.hazmat.primitives.serialization.ssh">cryptography.hazmat.primitives.serialization.ssh</a>
  &#8226;   <a href="#werkzeug.serving">werkzeug.serving</a>
@@ -9784,6 +9887,7 @@ imports:
 imported by:
     <a href="#_pyrepl.windows_console">_pyrepl.windows_console</a>
  &#8226;   <a href="#app.database">app.database</a>
+ &#8226;   <a href="#app.keystore">app.keystore</a>
  &#8226;   <a href="#click._winconsole">click._winconsole</a>
  &#8226;   <a href="#ctypes._aix">ctypes._aix</a>
  &#8226;   <a href="#ctypes._endian">ctypes._endian</a>
@@ -13566,6 +13670,7 @@ imports:
   <div class="import">
 imported by:
     <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#fastapi._compat">fastapi._compat</a>
  &#8226;   <a href="#fastapi._compat.v2">fastapi._compat.v2</a>
@@ -14312,6 +14417,7 @@ imports:
   <div class="import">
 imported by:
     <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#fastapi">fastapi</a>
  &#8226;   <a href="#fastapi.openapi.utils">fastapi.openapi.utils</a>
 
@@ -15537,6 +15643,7 @@ imports:
 imported by:
     <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#cryptography.x509.extensions">cryptography.x509.extensions</a>
  &#8226;   <a href="#hmac">hmac</a>
@@ -17149,8 +17256,10 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#app.catalog_sync">app.catalog_sync</a>
+    <a href="#app.accounts">app.accounts</a>
+ &#8226;   <a href="#app.catalog_sync">app.catalog_sync</a>
  &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.settings">app.settings</a>
  &#8226;   <a href="#fastapi.openapi.docs">fastapi.openapi.docs</a>
  &#8226;   <a href="#fastapi.routing">fastapi.routing</a>
@@ -19629,8 +19738,10 @@ imported by:
  &#8226;   <a href="#anyio.to_process">anyio.to_process</a>
  &#8226;   <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.database">app.database</a>
+ &#8226;   <a href="#app.keystore">app.keystore</a>
  &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#app.migrations">app.migrations</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.settings">app.settings</a>
  &#8226;   <a href="#argparse">argparse</a>
  &#8226;   <a href="#asyncio.base_events">asyncio.base_events</a>
@@ -24876,8 +24987,10 @@ imported by:
  &#8226;   <a href="#_sre">_sre</a>
  &#8226;   <a href="#_strptime">_strptime</a>
  &#8226;   <a href="#anyio.streams.tls">anyio.streams.tls</a>
+ &#8226;   <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.catalog_sync">app.catalog_sync</a>
  &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#argparse">argparse</a>
  &#8226;   <a href="#ast">ast</a>
  &#8226;   <a href="#click._compat">click._compat</a>
@@ -25313,6 +25426,7 @@ imports:
 imported by:
     <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.main">app.main</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#multiprocessing.shared_memory">multiprocessing.shared_memory</a>
  &#8226;   <a href="#pydantic.types">pydantic.types</a>
@@ -29052,7 +29166,8 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#argparse">argparse</a>
+    <a href="#app.packages">app.packages</a>
+ &#8226;   <a href="#argparse">argparse</a>
  &#8226;   <a href="#click._termui_impl">click._termui_impl</a>
  &#8226;   <a href="#click.formatting">click.formatting</a>
  &#8226;   <a href="#click.shell_completion">click.shell_completion</a>
@@ -29334,6 +29449,7 @@ imports:
   <div class="import">
 imported by:
     <a href="#app.database">app.database</a>
+ &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#app.migrations">app.migrations</a>
  &#8226;   <a href="#app.models">app.models</a>
  &#8226;   <a href="#sqlalchemy">sqlalchemy</a>
@@ -33173,6 +33289,7 @@ imported by:
  &#8226;   <a href="#app.database">app.database</a>
  &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#app.models">app.models</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#app.security">app.security</a>
  &#8226;   <a href="#sqlalchemy">sqlalchemy</a>
  &#8226;   <a href="#sqlalchemy.ext.asyncio.session">sqlalchemy.ext.asyncio.session</a>
@@ -39014,7 +39131,9 @@ imported by:
  &#8226;   <a href="#anyio.to_interpreter">anyio.to_interpreter</a>
  &#8226;   <a href="#anyio.to_process">anyio.to_process</a>
  &#8226;   <a href="#anyio.to_thread">anyio.to_thread</a>
+ &#8226;   <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.database">app.database</a>
+ &#8226;   <a href="#app.keystore">app.keystore</a>
  &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#argparse">argparse</a>
  &#8226;   <a href="#ast">ast</a>
@@ -39502,6 +39621,7 @@ imported by:
  &#8226;   <a href="#app.accounts">app.accounts</a>
  &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#app.migrations">app.migrations</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#asyncio.base_events">asyncio.base_events</a>
  &#8226;   <a href="#asyncio.events">asyncio.events</a>
  &#8226;   <a href="#asyncio.mixins">asyncio.mixins</a>
@@ -39600,6 +39720,7 @@ imported by:
  &#8226;   <a href="#app.main">app.main</a>
  &#8226;   <a href="#app.migrations">app.migrations</a>
  &#8226;   <a href="#app.models">app.models</a>
+ &#8226;   <a href="#app.packages">app.packages</a>
  &#8226;   <a href="#asyncio.base_events">asyncio.base_events</a>
  &#8226;   <a href="#asyncio.windows_events">asyncio.windows_events</a>
  &#8226;   <a href="#click._termui_impl">click._termui_impl</a>
@@ -41093,7 +41214,8 @@ imports:
   </div>
   <div class="import">
 imported by:
-    <a href="#click._termui_impl">click._termui_impl</a>
+    <a href="#app.packages">app.packages</a>
+ &#8226;   <a href="#click._termui_impl">click._termui_impl</a>
  &#8226;   <a href="#email.utils">email.utils</a>
  &#8226;   <a href="#fastapi.telemetry._asgi">fastapi.telemetry._asgi</a>
  &#8226;   <a href="#fastapi.telemetry._runtime">fastapi.telemetry._runtime</a>

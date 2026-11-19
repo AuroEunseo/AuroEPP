@@ -24,4 +24,4 @@ backend/*.db-*
 backend/backups/
 bak/*.db
 *.patch
-patch/
+patch/bak/

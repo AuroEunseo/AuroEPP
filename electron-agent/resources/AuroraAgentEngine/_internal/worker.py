@@ -17,6 +17,8 @@ import os
 from agent_log import get_logger
 from config import DATA_DIR, load_server_url
 from identity import wait_for_approval, get_os_info, get_or_create_identity
+from task_status import TaskBoard
+import pkg_engine
 from wua_engine import (
     NOWIN,
     apply_registry_item,
@@ -26,14 +28,24 @@ from wua_engine import (
     enforce_updates,
 )
 
-AGENT_VER = "1.0.2"
+AGENT_VER = "1.0.3"  # electron-agent/package.json 의 version 과 맞춰 관리
 CHECKIN_INTERVAL = 20
-AUTO_SCAN_INTERVAL = 300
+# Windows Update 검색은 무거운 작업(CPU·네트워크)이라 주기적으로 하지 않는다.
+# 검색 시점: ① 콘솔이 요청할 때(콘솔 첫 접속 시 자동 1회, [업데이트 다시 검색] 버튼, PC별 [즉시 스캔])
+#           ② 관리자가 KB 규칙을 바꿨을 때(숨김/허용 적용 후 결과 확인) ③ 설치 명령 실행 후
 
 REPORT_HISTORY_MAX = 30       # 정기 보고 시 전송하는 설치/제거 이력 건수
 FULL_HISTORY_MAX = 100        # 상세 모달 요청 시 전송하는 전체 이력 최대 건수
 REG_HISTORY_FILE = os.path.join(DATA_DIR, "registry_history.json")
 REG_HISTORY_KEEP = 200
+
+# 트레이 '진행 중인 작업'에 보여줄 Windows 업데이트 작업 이름 (이력 조회는 표시하지 않음)
+WU_TASK_TITLE = {
+    "scan": "Windows 업데이트 검색",
+    "rules": "업데이트 규칙 적용",
+    "install_all": "Windows 업데이트 설치",
+    "single_kb": "업데이트 개별 작업",
+}
 
 log = get_logger()
 
@@ -75,6 +87,12 @@ class AgentWorker:
         self.first_checkin = True
         # 서버 전송 대기 중인 레지스트리 변경 기록 (전송 성공 시에만 비움)
         self.pending_reg_changes: list[dict] = self._load_unsent_reg_changes()
+        # 프로그램 배포: 설치 작업 전용 큐(Windows 업데이트 작업과 별도로 한 번에 하나씩 실행)
+        self.tasks = TaskBoard()
+        self.pkg_queue: queue.Queue = queue.Queue()
+        self.ident: dict | None = None
+        self.software_dirty = True  # 설치 프로그램 목록을 다음 체크인 때 보고할지
+        self.pending_progress: list[dict] = []  # 전송 실패한 배포 결과 (다음 체크인 전에 재전송)
 
     # ------------------------------------------------------------------
     # 레지스트리 변경 이력 (로컬 보관 + 서버 보고)
@@ -128,6 +146,11 @@ class AgentWorker:
             self.busy.set()
             kind = task["kind"]
             extra_rules = task.get("rules", [])
+            title = WU_TASK_TITLE.get(kind)
+            tid = self.tasks.start("update", title) if title else None
+            if tid:
+                self.tasks.update(tid, status="진행 중")
+            ok, detail = True, ""
             try:
                 msgs = []
                 # Merge global rules + one-time command rules
@@ -136,7 +159,8 @@ class AgentWorker:
                     merged_map[r["kb"]] = r["action"]
                 merged_rules = [{"kb": k, "action": v} for k, v in merged_map.items()]
 
-                if kind != "history_full" and (merged_rules or kind == "install_all"):
+                # 규칙 적용(숨김/해제/설치)은 '규칙 변경'·'설치 명령'일 때만. 단순 검색(scan)·이력 요청은 검색만 수행
+                if kind in ("rules", "install_all", "single_kb") and (merged_rules or kind == "install_all"):
                     msgs = enforce_updates(merged_rules, install_all=(kind == "install_all"))
 
                 scan_data = scan_updates()
@@ -163,10 +187,16 @@ class AgentWorker:
                     self.pending_report = report
                     for m in msgs:
                         self.cmd_results.append({"type": "update", "ok": True, "out": m})
+                detail = f"대기 중인 업데이트 {len(report['updates'])}건"
+                if kind == "scan":
+                    self.software_dirty = True  # 검색 요청 시 설치 프로그램 목록도 함께 갱신
             except Exception as e:
+                ok, detail = False, str(e)[:200]
                 with self.lock:
                     self.cmd_results.append({"type": kind, "ok": False, "out": str(e)[:250]})
             finally:
+                if tid:
+                    self.tasks.finish(tid, ok, detail)
                 self.busy.clear()
                 # 스캔/설치 결과를 다음 주기까지 기다리지 않고 즉시 보고
                 self.wake_event.set()
@@ -216,7 +246,8 @@ class AgentWorker:
         return {"mac_addr": mac_addr, "cpu_info": cpu_info, "ram_gb": ram_gb}
 
     def _enqueue_job(self, kind: str, rules: list[dict] = None):
-        if kind != "sync" or (not self.busy.is_set() and self.job_queue.empty()):
+        # 단순 검색은 이미 작업 중이거나 대기 중이면 생략 (작업 끝에 어차피 검색 결과를 보고함)
+        if kind != "scan" or (not self.busy.is_set() and self.job_queue.empty()):
             self.job_queue.put({"kind": kind, "rules": rules or []})
 
     # ------------------------------------------------------------------
@@ -241,6 +272,115 @@ class AgentWorker:
                 break
         self.wake_event.clear()
 
+    # ------------------------------------------------------------------
+    # 프로그램 배포 (서명 검증 → 다운로드 → 해시 확인 → 무인 설치/삭제)
+    # ------------------------------------------------------------------
+    def _report_progress(self, did: int, status: str, progress: int = 0, message: str = "", exit_code=None):
+        item = {"deployment_id": did, "status": status, "progress": progress, "message": message[:500],
+                "exit_code": exit_code}
+        if not self._post_progress(item) and status in ("success", "failed"):
+            with self.lock:
+                self.pending_progress.append(item)  # 최종 결과는 반드시 전달되도록 보관 후 재전송
+
+    def _post_progress(self, item: dict) -> bool:
+        ident = self.ident
+        if not ident:
+            return False
+        try:
+            req = urllib.request.Request(
+                f"{self.server_url}/api/agent/progress",
+                data=json.dumps(item, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Machine-ID": ident["machine_id"],
+                         "X-Agent-Token": ident["agent_token"]},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            return True
+        except Exception:
+            return False
+
+    def _flush_progress(self):
+        with self.lock:
+            items, self.pending_progress = self.pending_progress, []
+        for it in items:
+            if not self._post_progress(it):
+                with self.lock:
+                    self.pending_progress.append(it)
+
+    def _pkg_worker(self):
+        while not self.stop_event.is_set():
+            try:
+                body = self.pkg_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            self._run_pkg_job(body)
+
+    def _run_pkg_job(self, body: dict):
+        did = body["deployment_id"]
+        action = body["action"]
+        verb = "설치" if action == "install" else "삭제"
+        title = f"{body['name']} {body.get('version', '')} {verb}".replace("  ", " ")
+        tid = self.tasks.start("package", title, ref=did)
+        log.info("프로그램 %s 시작: %s (배포 #%s)", verb, title, did)
+        try:
+            if action == "install":
+                self.tasks.update(tid, status="다운로드 중", progress=0)
+                self._report_progress(did, "downloading", 0, "다운로드 시작")
+
+                def on_dl(pct, text):
+                    self.tasks.update(tid, progress=pct, detail=text)
+                    if pct % 10 == 0 or pct == 100:
+                        self._post_progress({"deployment_id": did, "status": "downloading", "progress": pct,
+                                             "message": text, "exit_code": None})
+
+                path = pkg_engine.download(self.server_url, self.ident, body, on_dl)
+                self.tasks.update(tid, status="설치 중", progress=None, detail="무인 설치 실행 중")
+                self._report_progress(did, "installing", 100, "무인 설치 실행 중")
+                code, note = pkg_engine.install(path, body)
+            else:
+                self.tasks.update(tid, status="삭제 중", detail="무인 삭제 실행 중")
+                self._report_progress(did, "uninstalling", 0, "무인 삭제 실행 중")
+                code, note = pkg_engine.uninstall(body)
+
+            # 설치 여부 확인: '프로그램 추가/제거' 목록에서 다시 찾아본다
+            found = pkg_engine.find_installed(body.get("detect_name") or body["name"])
+            if action == "install":
+                check = f"설치 확인됨 ({found['name']} {found['version']})" if found else \
+                    "설치 프로그램은 정상 종료했지만 '프로그램 추가/제거' 목록에서 찾지 못함 (확인용 이름 점검 필요)"
+            else:
+                check = "삭제 확인됨" if not found else f"삭제 후에도 목록에 남아 있음 ({found['name']})"
+            msg = " · ".join(x for x in (note, check) if x)
+            self._report_progress(did, "success", 100, msg, code)
+            self.tasks.finish(tid, True, msg)
+            log.info("프로그램 %s 완료: %s (종료 코드 %s) %s", verb, title, code, msg)
+        except pkg_engine.PackageError as e:
+            self._report_progress(did, "failed", 0, str(e), e.exit_code)
+            self.tasks.finish(tid, False, str(e))
+            log.warning("프로그램 %s 실패: %s — %s", verb, title, e)
+        except Exception as e:
+            self._report_progress(did, "failed", 0, f"에이전트 오류: {e}")
+            self.tasks.finish(tid, False, str(e)[:200])
+            log.exception("프로그램 작업 오류")
+        finally:
+            self.software_dirty = True
+            self.wake_event.set()
+
+    def _accept_pkg_command(self, ctype: str, cpayload: dict):
+        """서명을 검증한 명령만 설치 큐에 넣는다. 검증 실패 시 실행하지 않고 실패로 보고"""
+        did = cpayload.get("deployment_id")
+        try:
+            body = pkg_engine.verify_command(cpayload, (self.ident or {}).get("machine_id", ""))
+            if f"pkg_{body['action']}" != ctype or body["deployment_id"] != did:
+                raise pkg_engine.PackageError("명령 종류와 서명된 내용이 일치하지 않음")
+        except pkg_engine.PackageError as e:
+            log.warning("프로그램 배포 명령 거부: %s", e)
+            if did:
+                self._report_progress(did, "failed", 0, str(e))
+            with self.lock:
+                self.cmd_results.append({"type": ctype, "ok": False, "out": str(e)[:250]})
+            return
+        self.pkg_queue.put(body)
+
     def _restore_unsent(self, report_payload, results_payload):
         """체크인 실패 시 보고 내용/명령 결과를 다음 체크인에서 다시 보내도록 되돌림"""
         with self.lock:
@@ -256,7 +396,7 @@ class AgentWorker:
         kb = cpayload.get("kb", "")
 
         if ctype == "scan":
-            self._enqueue_job("sync")
+            self._enqueue_job("scan")
         elif ctype == "install_all":
             self._enqueue_job("install_all")
         elif ctype == "install_kb" and kb:
@@ -265,6 +405,8 @@ class AgentWorker:
             self._enqueue_job("single_kb", [{"kb": kb, "action": "block"}])
         elif ctype == "unhide_kb" and kb:
             self._enqueue_job("single_kb", [{"kb": kb, "action": "allow"}])
+        elif ctype in ("pkg_install", "pkg_uninstall"):
+            self._accept_pkg_command(ctype, cpayload)
         elif ctype == "report_history":
             self._enqueue_job("history_full")
         elif ctype == "reg_rollback":
@@ -306,6 +448,7 @@ class AgentWorker:
 
     def run(self):
         threading.Thread(target=self._bg_worker, daemon=True).start()
+        threading.Thread(target=self._pkg_worker, daemon=True).start()
         hw_specs = self.get_hardware_specs()
         log.info("에이전트 시작 (버전 %s, 서버 %s, 부팅 시각 %s)", AGENT_VER, load_server_url(),
                  time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(get_boot_ts() or 0)))
@@ -315,12 +458,12 @@ class AgentWorker:
             self.approved = False
             ident = wait_for_approval(load_server_url, AGENT_VER, self.stop_event, wait_fn=self._wait)
             self.approved = True
+            self.ident = ident
             log.info("승인 확인 → 체크인 시작")
             fail_count = 0
 
             applied_hash = ""
-            seen_rules_hash = None
-            last_scan_ts = 0.0
+            seen_rules_hash = None  # 첫 체크인 응답 값으로 초기화만 하고 검색하지 않음
             hotfix = ""
 
             # Step 2: Check-in loop after approval
@@ -337,6 +480,14 @@ class AgentWorker:
                         self.cmd_results.clear()
 
                     reg_payload = list(self.pending_reg_changes)
+
+                self._flush_progress()
+                software_payload = None
+                if self.software_dirty:
+                    try:
+                        software_payload = pkg_engine.public_software(pkg_engine.collect_software())
+                    except Exception as e:
+                        log.warning("설치 프로그램 목록 수집 실패: %s", e)
 
                 if report_payload:
                     hotfix = report_payload["hotfix"]
@@ -367,6 +518,8 @@ class AgentWorker:
                         body["history_full"] = report_payload["history_full"]
                 if reg_payload:
                     body["reg_changes"] = reg_payload
+                if software_payload is not None:
+                    body["software"] = software_payload
 
                 try:
                     req = urllib.request.Request(
@@ -388,6 +541,10 @@ class AgentWorker:
                     fail_count = 0
 
                     self.global_rules = res.get("rules", [])
+                    if software_payload is not None:
+                        self.software_dirty = False
+                    # 서버 서명 공개키 고정 (명령 처리 전에 먼저)
+                    pkg_engine.pin_pubkey(res.get("signing_pubkey", ""))
 
                     # 전송 성공한 레지스트리 변경 기록은 대기 목록에서 제거
                     if reg_payload:
@@ -406,10 +563,12 @@ class AgentWorker:
                         self.wake_event.set()
 
                     # Sync update list on rule change or periodic interval
-                    if res.get("rules_hash") != seen_rules_hash or (time.time() - last_scan_ts > AUTO_SCAN_INTERVAL):
-                        self._enqueue_job("sync")
+                    # KB 규칙이 바뀐 경우에만 규칙 적용 + 검색 (서비스 시작 직후 첫 응답은 기준값만 기록)
+                    if seen_rules_hash is None:
                         seen_rules_hash = res.get("rules_hash")
-                        last_scan_ts = time.time()
+                    elif res.get("rules_hash") != seen_rules_hash:
+                        seen_rules_hash = res.get("rules_hash")
+                        self._enqueue_job("rules")
 
                     # Apply registry policy
                     pol = res.get("policy", {})
