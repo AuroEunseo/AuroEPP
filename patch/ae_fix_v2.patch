@@ -1,0 +1,4917 @@
+diff --git a/.gitignore b/.gitignore
+index def4bd1..c25a07e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,4 +7,13 @@ release/
+ *.exe
+ *.msi
+ *.blockmap
+-.env
+\ No newline at end of file
++.env
++# --- 관제 서버 비밀 정보 (관리자 토큰 / 계정 DB / 최초 비밀번호) ---
++admin_token.json
++**/admin_token.json
++aurora_accounts.db
++aurora_accounts.db-*
++**/aurora_accounts.db
++**/aurora_accounts.db-*
++initial_admin_password.txt
++**/initial_admin_password.txt
+diff --git a/Dev-ops.bat b/Dev-ops.bat
+index 039de81..ba786ec 100644
+--- a/Dev-ops.bat
++++ b/Dev-ops.bat
+@@ -5,7 +5,7 @@ cd /d "%~dp0"
+ if not exist "%~dp0logs" mkdir "%~dp0logs"
+ 
+ :: 1. 백엔드 구동 (로그: logs\backend.log)
+-start "AURORA Backend" cmd /k "cd /d C:\Users\김은서\Desktop\Project_etc\PC_Agent\backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload > "%~dp0logs\backend.log" 2>&1"
++start "AURORA Backend" cmd /k "cd /d C:\Users\김은서\Desktop\Project_etc\PC_Agent\backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 1557 --reload > "%~dp0logs\backend.log" 2>&1"
+ 
+ :: 2. 프론트엔드(Vite) 구동 (로그: logs\frontend.log)
+ start "AURORA Frontend" cmd /k "cd /d C:\Users\김은서\Desktop\Project_etc\PC_Agent\frontend && npm run dev > "%~dp0logs\frontend.log" 2>&1"
+\ No newline at end of file
+diff --git a/agent/config.py b/agent/config.py
+index 2c87844..06221de 100644
+--- a/agent/config.py
++++ b/agent/config.py
+@@ -1,29 +1,49 @@
+-import configparser
++"""에이전트 서버 주소 설정 (단일 설정 지점)
++
++관제 서버 주소는 C:\\ProgramData\\AURORA\\agent_config.json 한 곳에서만 읽는다.
++이 파일은 트레이 앱(설정 창)이 저장하며, 서비스/워커/트레이가 모두 같은 파일을 사용한다.
++
++{
++  "server_ip": "192.168.0.10",
++  "server_port": 1557
++}
++"""
++import json
+ import os
++import re
+ import sys
+ 
+-# 빌드 시 기본으로 내장할 관리 서버 주소 (배포 환경에 맞게 수정)
+-DEFAULT_SERVER_URL = "http://127.0.0.1:8080"
++DEFAULT_SERVER_IP = "127.0.0.1"
++DEFAULT_SERVER_PORT = 1557
++
++DATA_DIR = (
++    os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "AURORA")
++    if sys.platform == "win32"
++    else os.path.expanduser("~/.aurora")
++)
++CONFIG_FILE = os.path.join(DATA_DIR, "agent_config.json")
++
++
++def _normalize_host(raw: str) -> str:
++    host = re.sub(r"^https?://", "", str(raw or "").strip(), flags=re.I)
++    host = host.split("/")[0]
++    host = re.sub(r":\d+$", "", host)
++    return host or DEFAULT_SERVER_IP
+ 
+-def get_exe_dir() -> str:
+-    if getattr(sys, "frozen", False):
+-        return os.path.dirname(sys.executable)
+-    return os.path.dirname(os.path.abspath(__file__))
+ 
+ def load_server_url() -> str:
+-    # 1순위: 환경변수
+-    env_url = os.getenv("AURORA_SERVER")
+-    if env_url:
+-        return env_url.rstrip("/")
+-
+-    # 2순위: 실행 파일 옆에 aurora.ini가 있는 경우 읽기
+-    ini_path = os.path.join(get_exe_dir(), "aurora.ini")
+-    if os.path.exists(ini_path):
+-        cfg = configparser.ConfigParser()
+-        cfg.read(ini_path, encoding="utf-8")
+-        url = cfg.get("aurora", "server", fallback="").strip()
+-        if url:
+-            return url.rstrip("/")
+-
+-    # 3순위: 코드에 내장된 기본 서버 주소
+-    return DEFAULT_SERVER_URL.rstrip("/")
+\ No newline at end of file
++    ip, port = DEFAULT_SERVER_IP, DEFAULT_SERVER_PORT
++    try:
++        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
++            cfg = json.load(f)
++        if cfg.get("server_ip"):
++            ip = _normalize_host(cfg["server_ip"])
++            port = int(cfg.get("server_port") or DEFAULT_SERVER_PORT)
++        elif cfg.get("server_url"):  # 이전 버전 설정 파일 호환
++            m = re.match(r"^(?:https?://)?([^/:]+)(?::(\d+))?", str(cfg["server_url"]).strip())
++            if m:
++                ip = m.group(1)
++                port = int(m.group(2) or DEFAULT_SERVER_PORT)
++    except (OSError, ValueError, TypeError):
++        pass
++    return f"http://{ip}:{port}"
+diff --git a/agent/identity.py b/agent/identity.py
+index 4b4f70b..7b5f1ca 100644
+--- a/agent/identity.py
++++ b/agent/identity.py
+@@ -13,7 +13,7 @@ IS_WIN = sys.platform == "win32"
+ if IS_WIN:
+     import winreg
+ 
+-STATE_DIR = r"C:\ProgramData\AURORA" if IS_WIN else os.path.expanduser("~/.aurora")
++from config import DATA_DIR as STATE_DIR  # noqa: E402  (서비스·트레이와 같은 데이터 폴더)
+ IDENTITY_FILE = os.path.join(STATE_DIR, "identity.json")
+ 
+ 
+@@ -74,9 +74,10 @@ def get_or_create_identity(force_new_token: bool = False) -> dict:
+     return ident
+ 
+ 
+-def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None, wait_fn=None) -> dict:
++def wait_for_approval(server_url, agent_ver: str = "1.0", stop_event=None, wait_fn=None) -> dict:
+     """서버에 토큰·PC이름·OS버전을 등록하고 콘솔 관리자가 승인할 때까지 대기
+ 
++    server_url: 주소 문자열 또는 주소를 돌려주는 함수(설정 변경을 매 요청마다 반영)
+     wait_fn: 대기 함수(초 단위). 지정 시 서비스 중지/즉시 동기화 요청에 바로 반응한다.
+     """
+     sleep = wait_fn or time.sleep
+@@ -98,7 +99,7 @@ def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None,
+ 
+         try:
+             req = urllib.request.Request(
+-                f"{server_url}/api/agents/register",
++                f"{server_url() if callable(server_url) else server_url}/api/agents/register",
+                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                 headers={"Content-Type": "application/json"},
+             )
+@@ -108,8 +109,8 @@ def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None,
+                     return ident
+         except urllib.error.HTTPError as e:
+             if e.code == 403:
+-                # 거부된 경우 60초 후 재시도
+-                sleep(60)
++                # 거부된 경우 30초 후 재시도 (콘솔에서 거부 해제 시 30초 이내 '응답 확인됨' 표시)
++                sleep(30)
+                 continue
+         except Exception:
+             pass
+diff --git a/agent/service.py b/agent/service.py
+index 0602dcf..53d10a4 100644
+--- a/agent/service.py
++++ b/agent/service.py
+@@ -25,26 +25,9 @@ if sys.platform == "win32":
+ 
+ from worker import AgentWorker
+ 
+-DATA_DIR = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "AURORA")
+-CONFIG_FILE = os.path.join(DATA_DIR, "agent_config.json")
+-IDENTITY_FILE = os.path.join(DATA_DIR, "identity.json")
+-
++from config import DATA_DIR, load_server_url  # 서버 주소 단일 설정 지점 (agent_config.json)
+ 
+-def load_server_base_url() -> str:
+-    """agent_config.json에서 관리자가 입력한 서버 IP와 포트를 읽어 URL 반환"""
+-    if os.path.exists(CONFIG_FILE):
+-        try:
+-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+-                cfg = json.load(f)
+-                ip = str(cfg.get("server_ip", "")).strip()
+-                port = int(cfg.get("server_port", 8080))
+-                if ip:
+-                    return f"http://{ip}:{port}"
+-                if cfg.get("server_url"):
+-                    return str(cfg["server_url"]).rstrip("/")
+-        except Exception:
+-            pass
+-    return "http://127.0.0.1:8080"
++IDENTITY_FILE = os.path.join(DATA_DIR, "identity.json")
+ 
+ 
+ def load_identity() -> dict:
+@@ -58,20 +41,12 @@ def load_identity() -> dict:
+ 
+ 
+ class RealtimeAgentRunner:
+-    """기존 AgentWorker에 실시간 SSE 푸시 채널과 동적 서버 IP/포트 설정을 결합하는 실행기"""
++    """AgentWorker에 실시간 SSE 푸시 채널을 결합하는 실행기"""
+ 
+     def __init__(self, stop_event: threading.Event):
+         self.stop_event = stop_event
+         self.worker = AgentWorker(stop_event)
+ 
+-    def _apply_dynamic_server_url(self):
+-        base_url = load_server_base_url()
+-        for attr in ("server_url", "base_url", "api_url"):
+-            if hasattr(self.worker, attr):
+-                setattr(self.worker, attr, base_url)
+-        if hasattr(self.worker, "config") and isinstance(self.worker.config, dict):
+-            self.worker.config["server_url"] = base_url
+-
+     def trigger_immediate_sync(self):
+         """실시간 푸시 수신 시 대기 없이 즉시 정책/명령 동기화 요청.
+ 
+@@ -79,7 +54,6 @@ class RealtimeAgentRunner:
+         (여러 푸시가 몰려와도 체크인은 한 번으로 합쳐짐)
+         """
+         try:
+-            self._apply_dynamic_server_url()
+             self.worker.sync_once()
+         except Exception:
+             pass
+@@ -97,7 +71,7 @@ class RealtimeAgentRunner:
+                 self.stop_event.wait(5.0)
+                 continue
+ 
+-            base_url = load_server_base_url()
++            base_url = load_server_url()
+             stream_url = f"{base_url}/api/agent/stream?machine_id={urllib.parse.quote(machine_id)}"
+             req = urllib.request.Request(
+                 stream_url,
+@@ -125,7 +99,6 @@ class RealtimeAgentRunner:
+             backoff = min(backoff * 2, 60.0)
+ 
+     def run(self):
+-        self._apply_dynamic_server_url()
+         sse_thread = threading.Thread(target=self._sse_listener_loop, daemon=True)
+         sse_thread.start()
+         self.worker.run()
+diff --git a/agent/worker.py b/agent/worker.py
+index 626de33..d263832 100644
+--- a/agent/worker.py
++++ b/agent/worker.py
+@@ -11,12 +11,15 @@ import time
+ import urllib.error
+ import urllib.request
+ 
+-from config import load_server_url
++import os
++
++from config import DATA_DIR, load_server_url
+ from identity import wait_for_approval, get_os_info, get_or_create_identity
+ from wua_engine import (
+     NOWIN,
+     apply_registry_item,
+     is_reboot_pending,
++    restore_registry_value,
+     scan_updates,
+     enforce_updates,
+ )
+@@ -25,6 +28,18 @@ AGENT_VER = "1.0.2"
+ CHECKIN_INTERVAL = 20
+ AUTO_SCAN_INTERVAL = 300
+ 
++REPORT_HISTORY_MAX = 30       # 정기 보고 시 전송하는 설치/제거 이력 건수
++FULL_HISTORY_MAX = 100        # 상세 모달 요청 시 전송하는 전체 이력 최대 건수
++REG_HISTORY_FILE = os.path.join(DATA_DIR, "registry_history.json")
++REG_HISTORY_KEEP = 200
++
++
++def _install_uninstall_only(hist: list[dict], limit: int) -> list[dict]:
++    """Windows Update 이력 중 설치(op=1)/제거(op=2)만 최신순으로 limit 건"""
++    rows = [h for h in hist if h.get("op") in (1, 2)]
++    rows.sort(key=lambda h: h.get("date") or "", reverse=True)
++    return rows[:limit]
++
+ 
+ class AgentWorker:
+     def __init__(self, stop_event: threading.Event):
+@@ -39,6 +54,50 @@ class AgentWorker:
+         # SSE 푸시 수신 시 체크인 대기를 즉시 깨우기 위한 이벤트
+         self.wake_event = threading.Event()
+         self.approved = False
++        # 서버 전송 대기 중인 레지스트리 변경 기록 (전송 성공 시에만 비움)
++        self.pending_reg_changes: list[dict] = self._load_unsent_reg_changes()
++
++    # ------------------------------------------------------------------
++    # 레지스트리 변경 이력 (로컬 보관 + 서버 보고)
++    # ------------------------------------------------------------------
++    def _load_unsent_reg_changes(self) -> list[dict]:
++        try:
++            with open(REG_HISTORY_FILE, "r", encoding="utf-8") as f:
++                return [c for c in json.load(f) if not c.get("sent")]
++        except (OSError, ValueError):
++            return []
++
++    def _record_reg_changes(self, changes: list[dict]):
++        if not changes:
++            return
++        with self.lock:
++            self.pending_reg_changes.extend(changes)
++        try:
++            os.makedirs(DATA_DIR, exist_ok=True)
++            try:
++                with open(REG_HISTORY_FILE, "r", encoding="utf-8") as f:
++                    hist = json.load(f)
++            except (OSError, ValueError):
++                hist = []
++            hist.extend(changes)
++            with open(REG_HISTORY_FILE, "w", encoding="utf-8") as f:
++                json.dump(hist[-REG_HISTORY_KEEP:], f, ensure_ascii=False, indent=1)
++        except OSError:
++            pass
++
++    def _mark_reg_changes_sent(self, cids: set[str]):
++        if not cids:
++            return
++        try:
++            with open(REG_HISTORY_FILE, "r", encoding="utf-8") as f:
++                hist = json.load(f)
++            for c in hist:
++                if c.get("cid") in cids:
++                    c["sent"] = True
++            with open(REG_HISTORY_FILE, "w", encoding="utf-8") as f:
++                json.dump(hist[-REG_HISTORY_KEEP:], f, ensure_ascii=False, indent=1)
++        except (OSError, ValueError):
++            pass
+ 
+     def _bg_worker(self):
+         while not self.stop_event.is_set():
+@@ -58,23 +117,31 @@ class AgentWorker:
+                     merged_map[r["kb"]] = r["action"]
+                 merged_rules = [{"kb": k, "action": v} for k, v in merged_map.items()]
+ 
+-                if merged_rules or kind == "install_all":
++                if kind != "history_full" and (merged_rules or kind == "install_all"):
+                     msgs = enforce_updates(merged_rules, install_all=(kind == "install_all"))
+ 
+                 scan_data = scan_updates()
++                all_hist = scan_data.get("hist", [])
+                 done_kbs = [
+                     h["kb"]
+-                    for h in scan_data.get("hist", [])
++                    for h in all_hist
+                     if h.get("op") == 1 and h.get("rc") in (2, 3) and h.get("kb")
+                 ]
+                 hotfix_str = ",".join(dict.fromkeys(done_kbs))
+ 
++                report = {
++                    "updates": scan_data.get("pend", []),
++                    "history": _install_uninstall_only(all_hist, REPORT_HISTORY_MAX),
++                    "hotfix": hotfix_str,
++                }
++                if kind == "history_full":
++                    report["history_full"] = _install_uninstall_only(all_hist, FULL_HISTORY_MAX)
++
+                 with self.lock:
+-                    self.pending_report = {
+-                        "updates": scan_data.get("pend", []),
+-                        "history": scan_data.get("hist", []),
+-                        "hotfix": hotfix_str,
+-                    }
++                    # 아직 전송되지 않은 전체 이력 요청 결과는 덮어쓰지 않고 유지
++                    if self.pending_report and "history_full" in self.pending_report and "history_full" not in report:
++                        report["history_full"] = self.pending_report["history_full"]
++                    self.pending_report = report
+                     for m in msgs:
+                         self.cmd_results.append({"type": "update", "ok": True, "out": m})
+             except Exception as e:
+@@ -155,6 +222,14 @@ class AgentWorker:
+                 break
+         self.wake_event.clear()
+ 
++    def _restore_unsent(self, report_payload, results_payload):
++        """체크인 실패 시 보고 내용/명령 결과를 다음 체크인에서 다시 보내도록 되돌림"""
++        with self.lock:
++            if report_payload and not self.pending_report:
++                self.pending_report = report_payload
++            if results_payload:
++                self.cmd_results[:0] = results_payload[-50:]
++
+     def _run_command(self, cmd: dict):
+         ctype = cmd.get("type")
+         cpayload = cmd.get("payload") or {}
+@@ -170,6 +245,26 @@ class AgentWorker:
+             self._enqueue_job("single_kb", [{"kb": kb, "action": "block"}])
+         elif ctype == "unhide_kb" and kb:
+             self._enqueue_job("single_kb", [{"kb": kb, "action": "allow"}])
++        elif ctype == "report_history":
++            self._enqueue_job("history_full")
++        elif ctype == "reg_rollback":
++            err, change = restore_registry_value(
++                cpayload.get("path", ""),
++                cpayload.get("name", ""),
++                bool(cpayload.get("restore_exists")),
++                cpayload.get("restore_type"),
++                cpayload.get("restore_value"),
++            )
++            if change:
++                self._record_reg_changes([change])
++            target = f"{cpayload.get('path', '')}\\{cpayload.get('name', '')}"
++            with self.lock:
++                self.cmd_results.append({
++                    "type": "reg_rollback",
++                    "ok": not err,
++                    "ref": cpayload.get("ref"),
++                    "out": err or f"{target} 변경 전 값으로 복원 완료",
++                })
+         elif ctype in ("reboot", "shutdown"):
+             flag, verb, label = (
+                 ("/r", "Rebooting", "Reboot") if ctype == "reboot" else ("/s", "Shutting down", "Shutdown")
+@@ -196,7 +291,7 @@ class AgentWorker:
+         while not self.stop_event.is_set():
+             # Step 1: Wait for admin approval in console
+             self.approved = False
+-            ident = wait_for_approval(self.server_url, AGENT_VER, self.stop_event, wait_fn=self._wait)
++            ident = wait_for_approval(load_server_url, AGENT_VER, self.stop_event, wait_fn=self._wait)
+             self.approved = True
+ 
+             applied_hash = ""
+@@ -217,9 +312,13 @@ class AgentWorker:
+                         results_payload = list(self.cmd_results)
+                         self.cmd_results.clear()
+ 
++                    reg_payload = list(self.pending_reg_changes)
++
+                 if report_payload:
+                     hotfix = report_payload["hotfix"]
+ 
++                # 서버 주소는 매 체크인마다 agent_config.json(단일 설정 지점)에서 다시 읽는다
++                self.server_url = load_server_url()
+                 os_name, os_build = get_os_info()
+                 body = {
+                     "hostname": socket.gethostname(),
+@@ -237,6 +336,10 @@ class AgentWorker:
+                 if report_payload:
+                     body["updates"] = report_payload["updates"]
+                     body["history"] = report_payload["history"]
++                    if "history_full" in report_payload:
++                        body["history_full"] = report_payload["history_full"]
++                if reg_payload:
++                    body["reg_changes"] = reg_payload
+ 
+                 try:
+                     req = urllib.request.Request(
+@@ -253,9 +356,21 @@ class AgentWorker:
+ 
+                     self.global_rules = res.get("rules", [])
+ 
++                    # 전송 성공한 레지스트리 변경 기록은 대기 목록에서 제거
++                    if reg_payload:
++                        sent = {c["cid"] for c in reg_payload}
++                        with self.lock:
++                            self.pending_reg_changes = [
++                                c for c in self.pending_reg_changes if c["cid"] not in sent
++                            ]
++                        self._mark_reg_changes_sent(sent)
++
+                     # Process server commands
+                     for cmd in res.get("commands", []):
+                         self._run_command(cmd)
++                    # 즉시 실행된 명령(롤백·재부팅 등)의 결과를 다음 주기까지 기다리지 않고 바로 보고
++                    if res.get("commands"):
++                        self.wake_event.set()
+ 
+                     # Sync update list on rule change or periodic interval
+                     if res.get("rules_hash") != seen_rules_hash or (time.time() - last_scan_ts > AUTO_SCAN_INTERVAL):
+@@ -266,7 +381,14 @@ class AgentWorker:
+                     # Apply registry policy
+                     pol = res.get("policy", {})
+                     if pol.get("hash") and pol["hash"] != applied_hash:
+-                        errs = [e for e in map(apply_registry_item, pol.get("items", [])) if e]
++                        errs, changes = [], []
++                        for item in pol.get("items", []):
++                            err, change = apply_registry_item(item, pol["hash"])
++                            if err:
++                                errs.append(err)
++                            if change:
++                                changes.append(change)
++                        self._record_reg_changes(changes)
+                         with self.lock:
+                             self.cmd_results.append({
+                                 "type": "policy",
+@@ -278,10 +400,11 @@ class AgentWorker:
+                             continue
+ 
+                 except urllib.error.HTTPError as e:
++                    self._restore_unsent(report_payload, results_payload)
+                     if e.code in (401, 403, 404):
+                         get_or_create_identity(force_new_token=True)
+                         break
+                 except Exception:
+-                    pass
++                    self._restore_unsent(report_payload, results_payload)
+ 
+                 self._wait(CHECKIN_INTERVAL)
+diff --git a/agent/wua_engine.py b/agent/wua_engine.py
+index 4f20354..7c04ff6 100644
+--- a/agent/wua_engine.py
++++ b/agent/wua_engine.py
+@@ -4,6 +4,8 @@ import os
+ import re
+ import subprocess
+ import sys
++import time
++import uuid
+ 
+ IS_WIN = sys.platform == "win32"
+ NOWIN = 0x08000000 if IS_WIN else 0
+@@ -12,30 +14,106 @@ if IS_WIN:
+     import winreg
+ 
+ 
+-def apply_registry_item(item: dict) -> str | None:
++POLICY_ROOT = "SOFTWARE\\POLICIES\\"
++
++
++def _to_json_value(val):
++    if isinstance(val, (bytes, bytearray)):
++        return {"__hex__": bytes(val).hex()}
++    return val
++
++
++def _from_json_value(val):
++    if isinstance(val, dict) and "__hex__" in val:
++        return bytes.fromhex(val["__hex__"])
++    return val
++
++
++def read_registry_value(path: str, name: str):
++    """(존재 여부, winreg 타입 코드, 값) 반환"""
++    if not IS_WIN:
++        return False, None, None
++    try:
++        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
++            val, typ = winreg.QueryValueEx(k, name)
++            return True, typ, _to_json_value(val)
++    except OSError:
++        return False, None, None
++
++
++def _write_value(path: str, name: str, exists: bool, typ, value) -> None:
++    acc = winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
++    if not exists:
++        try:
++            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
++                winreg.DeleteValue(k, name)
++        except FileNotFoundError:
++            pass
++        return
++    with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
++        winreg.SetValueEx(k, name, 0, int(typ), _from_json_value(value))
++
++
++def _make_change(path, name, old, new, source, policy_hash="") -> dict:
++    return {
++        "cid": uuid.uuid4().hex,
++        "ts": time.time(),
++        "source": source,
++        "policy_hash": policy_hash,
++        "path": path,
++        "name": name,
++        "op": "set" if new[0] else "delete",
++        "old_exists": old[0], "old_type": old[1], "old_value": old[2],
++        "new_exists": new[0], "new_type": new[1], "new_value": new[2],
++    }
++
++
++def apply_registry_item(item: dict, policy_hash: str = ""):
++    """정책 항목 1건 적용. (오류 메시지 또는 None, 변경 기록 또는 None) 반환
++
++    값이 실제로 바뀐 경우에만 변경 전/후 값을 기록해 롤백할 수 있게 한다.
++    """
+     path = item.get("path", "")
+-    if not path.upper().startswith("SOFTWARE\\POLICIES\\"):
+-        return f"허용되지 않은 레지스트리 경로: {path}"
++    if not path.upper().startswith(POLICY_ROOT):
++        return f"허용되지 않은 레지스트리 경로: {path}", None
+     if not IS_WIN:
+-        return None
++        return None, None
+ 
++    name = item.get("name", "")
+     try:
+-        acc = winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
++        old = read_registry_value(path, name)
+         if item.get("op") == "delete":
+-            try:
+-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
+-                    winreg.DeleteValue(k, item["name"])
+-            except FileNotFoundError:
+-                pass
+-            return None
+-
+-        is_dword = item.get("type") == "DWORD"
+-        val = int(item["value"]) if is_dword else str(item["value"])
+-        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
+-            winreg.SetValueEx(k, item["name"], 0, winreg.REG_DWORD if is_dword else winreg.REG_SZ, val)
+-        return None
++            new = (False, None, None)
++        else:
++            is_dword = item.get("type") == "DWORD"
++            new = (
++                True,
++                winreg.REG_DWORD if is_dword else winreg.REG_SZ,
++                int(item["value"]) if is_dword else str(item["value"]),
++            )
++        if old == new or (not old[0] and not new[0]):
++            return None, None
++        _write_value(path, name, *new)
++        return None, _make_change(path, name, old, new, "policy", policy_hash)
++    except Exception as e:
++        return f"{path}\\{name}: {e}", None
++
++
++def restore_registry_value(path: str, name: str, exists: bool, typ, value):
++    """롤백: 변경 전 값으로 되돌린다. (오류 메시지 또는 None, 변경 기록 또는 None)"""
++    if not str(path).upper().startswith(POLICY_ROOT):
++        return f"허용되지 않은 레지스트리 경로: {path}", None
++    if not IS_WIN:
++        return None, None
++    try:
++        old = read_registry_value(path, name)
++        new = (bool(exists), typ if exists else None, value if exists else None)
++        if exists and typ is None:
++            return "복원할 값의 형식 정보가 없습니다.", None
++        _write_value(path, name, *new)
++        return None, _make_change(path, name, old, new, "rollback")
+     except Exception as e:
+-        return f"{path}\\{item.get('name')}: {e}"
++        return f"{path}\\{name}: {e}", None
+ 
+ 
+ def is_reboot_pending() -> bool:
+diff --git a/backend/app/accounts.py b/backend/app/accounts.py
+new file mode 100644
+index 0000000..3f3e83f
+--- /dev/null
++++ b/backend/app/accounts.py
+@@ -0,0 +1,200 @@
++"""관리자 콘솔 계정 DB (업데이트 관제 DB와 분리된 별도 SQLite 파일)
++
++- 파일: <데이터 폴더>/aurora_accounts.db
++- 비밀번호: PBKDF2-HMAC-SHA256(솔트 16바이트, 310,000회) 해시만 저장
++- 세션: 무작위 토큰을 발급하고 DB에는 SHA-256 해시만 저장 (마지막 사용 후 SESSION_HOURS 동안 유효)
++- 최초 실행 시 admin 계정을 만들고 임시 비밀번호를 initial_admin_password.txt 에 기록
++  → 첫 로그인 후 비밀번호를 변경하면 파일은 자동 삭제
++- 로그인 5회 연속 실패 시 해당 (계정, IP) 조합을 5분간 잠금
++"""
++import hashlib
++import hmac
++import os
++import secrets
++import sqlite3
++import threading
++import time
++
++from .database import BASE_DIR
++from .settings import SESSION_HOURS
++
++ACCOUNTS_DB = os.path.join(BASE_DIR, "aurora_accounts.db")
++INITIAL_PASSWORD_FILE = os.path.join(BASE_DIR, "initial_admin_password.txt")
++
++PBKDF2_ITER = 310_000
++MIN_PASSWORD_LEN = 8
++MAX_FAILS = 5
++LOCK_SEC = 300
++
++_lock = threading.Lock()
++_fail_counter: dict[tuple[str, str], list[float]] = {}
++
++
++def _conn() -> sqlite3.Connection:
++    c = sqlite3.connect(ACCOUNTS_DB, timeout=10)
++    c.row_factory = sqlite3.Row
++    return c
++
++
++def _hash_pw(password: str, salt: bytes, iterations: int = PBKDF2_ITER) -> str:
++    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations).hex()
++
++
++def _sha(raw: str) -> str:
++    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
++
++
++def init_accounts_db() -> None:
++    os.makedirs(BASE_DIR, exist_ok=True)
++    with _lock, _conn() as c:
++        c.executescript(
++            """
++            CREATE TABLE IF NOT EXISTS accounts (
++                username     TEXT PRIMARY KEY,
++                pw_hash      TEXT NOT NULL,
++                salt         TEXT NOT NULL,
++                iterations   INTEGER NOT NULL,
++                must_change  INTEGER NOT NULL DEFAULT 1,
++                created_at   REAL NOT NULL,
++                updated_at   REAL NOT NULL
++            );
++            CREATE TABLE IF NOT EXISTS sessions (
++                token_hash   TEXT PRIMARY KEY,
++                username     TEXT NOT NULL,
++                ip           TEXT,
++                created_at   REAL NOT NULL,
++                last_used    REAL NOT NULL
++            );
++            """
++        )
++        row = c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
++        if row == 0:
++            _create_account(c, "admin", _write_initial_password(), must_change=True)
++
++
++def _write_initial_password() -> str:
++    pw = secrets.token_urlsafe(12)
++    with open(INITIAL_PASSWORD_FILE, "w", encoding="utf-8") as f:
++        f.write(
++            "AURORA Control Console 최초 관리자 계정\n"
++            "아이디: admin\n"
++            f"임시 비밀번호: {pw}\n\n"
++            "첫 로그인 후 비밀번호를 변경하면 이 파일은 자동으로 삭제됩니다.\n"
++        )
++    return pw
++
++
++def _create_account(c: sqlite3.Connection, username: str, password: str, must_change: bool) -> None:
++    salt = secrets.token_bytes(16)
++    now = time.time()
++    c.execute(
++        "INSERT OR REPLACE INTO accounts(username, pw_hash, salt, iterations, must_change, created_at, updated_at) "
++        "VALUES (?,?,?,?,?,?,?)",
++        (username, _hash_pw(password, salt), salt.hex(), PBKDF2_ITER, 1 if must_change else 0, now, now),
++    )
++
++
++def _is_locked(username: str, ip: str) -> bool:
++    now = time.time()
++    fails = [t for t in _fail_counter.get((username, ip), []) if now - t < LOCK_SEC]
++    _fail_counter[(username, ip)] = fails
++    return len(fails) >= MAX_FAILS
++
++
++def authenticate(username: str, password: str, ip: str) -> tuple[bool, str, bool]:
++    """(성공여부, 메시지, 비밀번호 변경 필요 여부)"""
++    username = (username or "").strip()
++    with _lock:
++        if _is_locked(username, ip):
++            return False, "로그인 실패가 반복되어 5분간 잠겼습니다. 잠시 후 다시 시도하세요.", False
++        with _conn() as c:
++            row = c.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone()
++        ok = bool(row) and hmac.compare_digest(
++            row["pw_hash"], _hash_pw(password or "", bytes.fromhex(row["salt"]), row["iterations"])
++        )
++        if not ok:
++            _fail_counter.setdefault((username, ip), []).append(time.time())
++            return False, "아이디 또는 비밀번호가 올바르지 않습니다.", False
++        _fail_counter.pop((username, ip), None)
++        return True, "OK", bool(row["must_change"])
++
++
++def is_locked_out(username: str, ip: str) -> bool:
++    with _lock:
++        return _is_locked((username or "").strip(), ip)
++
++
++def create_session(username: str, ip: str) -> str:
++    token = secrets.token_urlsafe(32)
++    now = time.time()
++    with _lock, _conn() as c:
++        c.execute(
++            "INSERT INTO sessions(token_hash, username, ip, created_at, last_used) VALUES (?,?,?,?,?)",
++            (_sha(token), username, ip, now, now),
++        )
++    return token
++
++
++def get_session_user(token: str) -> dict | None:
++    if not token:
++        return None
++    now = time.time()
++    with _lock, _conn() as c:
++        row = c.execute(
++            "SELECT s.username, s.last_used, a.must_change FROM sessions s "
++            "JOIN accounts a ON a.username = s.username WHERE s.token_hash=?",
++            (_sha(token),),
++        ).fetchone()
++        if not row:
++            return None
++        if now - row["last_used"] > SESSION_HOURS * 3600:
++            c.execute("DELETE FROM sessions WHERE token_hash=?", (_sha(token),))
++            return None
++        if now - row["last_used"] > 60:
++            c.execute("UPDATE sessions SET last_used=? WHERE token_hash=?", (now, _sha(token)))
++        return {"username": row["username"], "must_change": bool(row["must_change"])}
++
++
++def delete_session(token: str) -> None:
++    with _lock, _conn() as c:
++        c.execute("DELETE FROM sessions WHERE token_hash=?", (_sha(token or ""),))
++
++
++def change_password(username: str, old_pw: str, new_pw: str, keep_token: str = "") -> tuple[bool, str]:
++    if len(new_pw or "") < MIN_PASSWORD_LEN:
++        return False, f"새 비밀번호는 {MIN_PASSWORD_LEN}자 이상이어야 합니다."
++    if new_pw == old_pw:
++        return False, "새 비밀번호가 현재 비밀번호와 같습니다."
++    with _lock, _conn() as c:
++        row = c.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone()
++        if not row or not hmac.compare_digest(
++            row["pw_hash"], _hash_pw(old_pw or "", bytes.fromhex(row["salt"]), row["iterations"])
++        ):
++            return False, "현재 비밀번호가 올바르지 않습니다."
++        _create_account(c, username, new_pw, must_change=False)
++        c.execute("UPDATE accounts SET created_at=? WHERE username=?", (row["created_at"], username))
++        # 비밀번호 변경 시 현재 세션을 제외한 모든 세션 종료
++        c.execute(
++            "DELETE FROM sessions WHERE username=? AND token_hash<>?", (username, _sha(keep_token or ""))
++        )
++    if username == "admin" and os.path.exists(INITIAL_PASSWORD_FILE):
++        try:
++            os.remove(INITIAL_PASSWORD_FILE)
++        except OSError:
++            pass
++    return True, "비밀번호가 변경되었습니다."
++
++
++def reset_password(username: str) -> str:
++    """비상용(서버 PC에서 관리자 권한으로 실행): 임시 비밀번호를 새로 발급"""
++    init_accounts_db()
++    pw = secrets.token_urlsafe(12)
++    with _lock, _conn() as c:
++        _create_account(c, username, pw, must_change=True)
++        c.execute("DELETE FROM sessions WHERE username=?", (username,))
++    return pw
++
++
++def purge_expired_sessions() -> None:
++    with _lock, _conn() as c:
++        c.execute("DELETE FROM sessions WHERE last_used < ?", (time.time() - SESSION_HOURS * 3600,))
+diff --git a/backend/app/database.py b/backend/app/database.py
+index 3190c6e..a50e7d4 100644
+--- a/backend/app/database.py
++++ b/backend/app/database.py
+@@ -31,6 +31,32 @@ if DATABASE_URL.startswith("sqlite"):
+ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+ Base = declarative_base()
+ 
++def secure_data_dir() -> None:
++    """패키징 실행(Windows) 시 데이터 폴더를 Administrators/SYSTEM 전용으로 제한
++
++    ProgramData 하위 폴더는 기본적으로 일반 사용자(Users)도 읽을 수 있어
++    계정 DB·업데이트 DB·백업 파일이 노출될 수 있으므로 상속을 끊고 권한을 재설정한다.
++    """
++    if sys.platform != "win32" or not getattr(sys, "frozen", False):
++        return
++    import subprocess
++
++    try:
++        subprocess.run(
++            [
++                "icacls", BASE_DIR, "/inheritance:r",
++                "/grant:r", "*S-1-5-32-544:(OI)(CI)F",   # BUILTIN\Administrators
++                "/grant:r", "*S-1-5-18:(OI)(CI)F",       # NT AUTHORITY\SYSTEM
++                "/T", "/C", "/Q",
++            ],
++            capture_output=True,
++            timeout=30,
++            creationflags=0x08000000,
++        )
++    except Exception:
++        pass
++
++
+ def get_db():
+     db = SessionLocal()
+     try:
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 74f4044..974b64c 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -13,29 +13,62 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import FileResponse, StreamingResponse
+ from fastapi.staticfiles import StaticFiles
+-from starlette.concurrency import run_in_threadpool
+ from sqlalchemy.orm import Session
++from starlette.concurrency import run_in_threadpool
+ 
++from . import accounts
+ from .catalog_sync import sync_catalog_database
+-from .database import BASE_DIR, Base, SessionLocal, engine, get_db
+-from .models import Agent, AgentCommand, EventLog, KbRule, Policy, UpdateCatalog
++from .database import BASE_DIR, SessionLocal, get_db, secure_data_dir
++from .migrations import get_status, run_startup
++from .models import (
++    AccessLog,
++    Agent,
++    AgentCommand,
++    EventLog,
++    KbRule,
++    Notification,
++    Policy,
++    RegistryChange,
++    UpdateCatalog,
++)
+ from .schemas import (
+     CheckinRequest,
+     CommandRequest,
+     DecisionRequest,
++    LoginRequest,
++    PasswordChangeRequest,
+     PolicySaveRequest,
+     RegisterRequest,
+     RingChangeRequest,
+     RuleRequest,
+ )
+-from .security import ADMIN_TOKEN, hash_token, verify_admin, verify_agent
+-
++from .security import (
++    check_admin_ip,
++    client_ip,
++    current_admin,
++    hash_token,
++    require_ready,
++    verify_admin,
++    verify_agent,
++)
++from .settings import (
++    COMMAND_TTL_SEC,
++    HISTORY_KEEP,
++    ONLINE_WINDOW_SEC,
++    PENDING_ALIVE_SEC,
++    REGISTRY_CHANGE_KEEP,
++    RETENTION_DAYS,
++    SERVER_CONFIG,
++)
+ 
+ # 기능 업데이트 고정 버전 기본값 (서비스 종료된 버전에 고정되지 않도록 환경변수로 지정 가능)
+ DEFAULT_TARGET_RELEASE = os.getenv("AURORA_TARGET_RELEASE", "25H2").strip() or "25H2"
+ # 기존 DB에 남아 있는 지원 종료 버전 기본값 → DEFAULT_TARGET_RELEASE 로 자동 전환
+ LEGACY_TARGET_RELEASES = {"24H2"}
+ 
++POLICY_ROOT = "SOFTWARE\\POLICIES\\"
++ADMIN_DEPS = [Depends(verify_admin), Depends(require_ready)]
++
+ 
+ def policy_hash(items: list) -> str:
+     return hashlib.sha1(json.dumps(items, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+@@ -45,19 +78,57 @@ def log_event(db: Session, host: str, msg: str):
+     db.add(EventLog(ts=time.time(), host=host, msg=msg[:500]))
+ 
+ 
+-def _periodic_catalog_worker():
+-    """6시간마다 Microsoft 공식 Windows 11 업데이트 및 사내 PC 보고 내역을 자동 수집"""
+-    while True:
+-        try:
+-            with SessionLocal() as db:
+-                sync_catalog_database(db, fetch_online=True)
+-        except Exception:
+-            pass
+-        time.sleep(6 * 3600)
++def notify_console(db: Session, level: str, category: str, title: str, message: str = "", machine_id: str = ""):
++    """콘솔 알림 탭에 '확인 필요' 항목 추가 (관리자가 확인하면 삭제됨)"""
++    db.add(
++        Notification(
++            ts=time.time(), level=level, category=category,
++            title=title[:128], message=message[:1000], machine_id=machine_id or "",
++        )
++    )
++
++
++def is_online(agent: Agent, now: float | None = None) -> bool:
++    return ((now or time.time()) - (agent.last_seen or 0)) < ONLINE_WINDOW_SEC
++
++
++# ==========================================
++# 콘솔 접속 로그 (DB 준비 전 발생분은 메모리에 잠시 보관 후 기록)
++# ==========================================
++_access_buffer: list[dict] = []
++_access_lock = threading.Lock()
++
++
++def write_access_log(username: str, ip: str, action: str, ok: bool, detail: str = ""):
++    with _access_lock:
++        _access_buffer.append(
++            {"ts": time.time(), "username": (username or "")[:64], "ip": ip, "action": action, "ok": ok,
++             "detail": detail[:256]}
++        )
++    if get_status()["ready"]:
++        flush_access_logs()
++
++
++def flush_access_logs():
++    with _access_lock:
++        items = list(_access_buffer)
++        _access_buffer.clear()
++    if not items:
++        return
++    try:
++        with SessionLocal() as db:
++            for it in items:
++                db.add(AccessLog(**it))
++            db.commit()
++    except Exception:
++        with _access_lock:
++            _access_buffer[:0] = items
+ 
+ 
++# ==========================================
++# 시작 시 데이터 준비 / 주기 작업
++# ==========================================
+ def init_default_data():
+-    Base.metadata.create_all(bind=engine)
+     db = SessionLocal()
+     try:
+         wu = "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate"
+@@ -82,31 +153,95 @@ def init_default_data():
+         if os.getenv("AURORA_KEEP_TARGET_RELEASE", "0") != "1":
+             for pol in db.query(Policy).all():
+                 items = json.loads(pol.items_json or "[]")
+-                changed = False
++                changed_from = None
+                 for it in items:
++                    val = str(it.get("value", "")).upper()
+                     if (
+                         it.get("name") == "TargetReleaseVersionInfo"
+-                        and str(it.get("value", "")).upper() in LEGACY_TARGET_RELEASES
+-                        and str(it.get("value", "")).upper() != DEFAULT_TARGET_RELEASE.upper()
++                        and val in LEGACY_TARGET_RELEASES
++                        and val != DEFAULT_TARGET_RELEASE.upper()
+                     ):
+-                        old_val = it.get("value")
++                        changed_from = it.get("value")
+                         it["value"] = DEFAULT_TARGET_RELEASE
+-                        changed = True
+-                if changed:
++                if changed_from is not None:
+                     pol.items_json = json.dumps(items, ensure_ascii=False)
+                     log_event(
+                         db, "server",
+-                        f"{pol.ring} 정책의 고정 버전 {old_val} → {DEFAULT_TARGET_RELEASE} 자동 변경 (지원 종료 버전)",
++                        f"{pol.ring} 정책의 고정 버전 {changed_from} → {DEFAULT_TARGET_RELEASE} 자동 변경 (지원 종료 버전)",
+                     )
+         db.commit()
+     finally:
+         db.close()
+ 
+ 
++def cleanup_old_records():
++    """보관 기간(7일)이 지난 이벤트/명령/접속/알림 로그와 만료된 명령·세션 정리"""
++    now = time.time()
++    cutoff = now - RETENTION_DAYS * 86400
++    with SessionLocal() as db:
++        db.query(EventLog).filter(EventLog.ts < cutoff).delete(synchronize_session=False)
++        db.query(AccessLog).filter(AccessLog.ts < cutoff).delete(synchronize_session=False)
++        db.query(Notification).filter(Notification.ts < cutoff).delete(synchronize_session=False)
++        # 명령 로그: 전달되지 못하고 TTL이 지난 명령은 즉시 폐기
++        db.query(AgentCommand).filter(AgentCommand.created_at < now - COMMAND_TTL_SEC).delete(
++            synchronize_session=False
++        )
++        db.commit()
++    accounts.purge_expired_sessions()
++
++
++def warm_load():
++    with SessionLocal() as db:
++        db.query(Agent).count()
++    flush_access_logs()
++
++
++def _periodic_worker():
++    """준비 완료 후: 1시간마다 로그 정리, 6시간마다 업데이트 카탈로그 수집"""
++    last_catalog = 0.0
++    while True:
++        if get_status()["ready"]:
++            try:
++                cleanup_old_records()
++                flush_access_logs()
++            except Exception:
++                pass
++            if time.time() - last_catalog > 6 * 3600:
++                last_catalog = time.time()
++                try:
++                    with SessionLocal() as db:
++                        sync_catalog_database(db, fetch_online=True)
++                except Exception:
++                    pass
++            time.sleep(3600)
++        else:
++            time.sleep(2)
++
++
++def _startup_sequence():
++    run_startup(
++        post_steps=[
++            ("seed", "기본 배포 정책을 확인하는 중입니다...", init_default_data),
++            ("cleanup", f"{RETENTION_DAYS}일이 지난 로그를 정리하는 중입니다...", cleanup_old_records),
++            ("load", "PC 목록을 불러오는 중입니다...", warm_load),
++        ]
++    )
++    st = get_status()
++    if st["ready"]:
++        with SessionLocal() as db:
++            if st["rebuilt_tables"]:
++                notify_console(
++                    db, "info", "system", "DB 구조가 갱신되었습니다",
++                    f"갱신된 테이블: {', '.join(st['rebuilt_tables'])} / 백업: {os.path.basename(st['backup_file'])}",
++                )
++            db.commit()
++
++
+ # ==========================================
+ # 실시간 에이전트 알림 스트림 큐 (SSE)
+ # ==========================================
+-# machine_id -> (이벤트 루프, 큐). 동기 API(스레드풀)에서도 안전하게 넣을 수 있도록 루프를 함께 보관
++# machine_id -> (이벤트 루프, 큐). 동기 API(스레드풀)에서도 안전하게 넣을 수 있도록 루프를 함께 보관.
++# 큐의 알림은 에이전트에 1회 전달되면 즉시 사라지며, 연결 종료·토큰 폐기·삭제 시 항목 자체를 정리한다.
+ AGENT_STREAMS: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = {}
+ 
+ 
+@@ -125,13 +260,22 @@ def notify_agent_realtime(machine_id: str, event_type: str = "sync"):
+     loop, q = entry
+     msg = {"type": event_type, "ts": time.time()}
+     try:
+-        # 동기 엔드포인트는 스레드풀에서 실행되므로 이벤트 루프 스레드로 넘겨서 넣는다
+         loop.call_soon_threadsafe(_queue_put, q, msg)
+     except RuntimeError:
+-        # 루프가 이미 종료된 경우
+         AGENT_STREAMS.pop(machine_id, None)
+ 
+ 
++def close_agent_stream(machine_id: str):
++    """토큰 폐기/거부/삭제 시 열려 있는 스트림을 종료하고 메모리에서 제거"""
++    entry = AGENT_STREAMS.pop(machine_id, None)
++    if entry:
++        loop, q = entry
++        try:
++            loop.call_soon_threadsafe(_queue_put, q, {"type": "close"})
++        except RuntimeError:
++            pass
++
++
+ def _verify_stream_agent(machine_id: str, raw_token: str) -> bool:
+     """짧은 세션으로 검증만 하고 즉시 반환 (스트림이 DB 연결을 붙잡지 않도록)"""
+     with SessionLocal() as db:
+@@ -156,17 +300,20 @@ def notify_ring_realtime(db: Session, ring: str, event_type: str = "policy"):
+ 
+ @asynccontextmanager
+ async def lifespan(_: FastAPI):
+-    init_default_data()
+-    # 서버 시작 시 6시간 주기 Windows 11 업데이트 카탈로그 자동 수집 스레드 가동
+-    threading.Thread(target=_periodic_catalog_worker, daemon=True).start()
++    secure_data_dir()
++    accounts.init_accounts_db()
++    threading.Thread(target=_startup_sequence, daemon=True).start()
++    threading.Thread(target=_periodic_worker, daemon=True).start()
+     print("=" * 60)
+     print("  AURORA Update Control Server 가동됨")
+-    print(f"  관리자 콘솔 접속 토큰: {ADMIN_TOKEN}")
++    print(f"  주소: http://{SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}  (설정: server_config.json)")
++    if os.path.exists(accounts.INITIAL_PASSWORD_FILE):
++        print(f"  최초 관리자 계정 정보: {accounts.INITIAL_PASSWORD_FILE}")
+     print("=" * 60)
+     yield
+ 
+ 
+-app = FastAPI(title="AURORA Update Control API", lifespan=lifespan)
++app = FastAPI(title="AURORA Update Control API", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+ 
+ app.add_middleware(
+     CORSMiddleware,
+@@ -176,42 +323,71 @@ app.add_middleware(
+ )
+ 
+ 
++# ==========================================
++# 0. 상태 확인 (로그인 전/후 공용)
++# ==========================================
++@app.get("/api/health")
++def health():
++    st = get_status()
++    return {"ok": True, "ready": st["ready"]}
++
++
+ # ==========================================
+ # 1. 에이전트 통신 API (무인 등록, 체크인, 실시간 스트림, 종료 보고)
+ # ==========================================
+ 
+-@app.post("/api/agents/register")
++@app.post("/api/agents/register", dependencies=[Depends(require_ready)])
+ def register_agent(req: RegisterRequest, request: Request, db: Session = Depends(get_db)):
+-    """에이전트 PC가 자체 생성한 토큰 + PC이름 + OS버전을 전송해 등록 요청"""
++    """에이전트 PC가 자체 생성한 토큰 + PC이름 + OS버전을 전송해 등록 요청 (승인 대기 중 15초마다 반복)"""
+     t_hash = hash_token(req.agent_token)
+     preview = f"{req.agent_token[:6]}...{req.agent_token[-4:]}" if len(req.agent_token) > 10 else "***"
+-    client_ip = request.client.host if request.client else "unknown"
++    ip = client_ip(request)
+ 
+     agent = db.query(Agent).filter(Agent.machine_id == req.machine_id).first()
+     if agent:
+         if agent.status == "rejected":
++            agent.last_seen = time.time()  # 거부 목록에서도 '응답 중'인지 확인할 수 있도록 갱신
++            agent.ip = ip
++            db.commit()
+             raise HTTPException(status_code=403, detail="관리자에 의해 등록이 거부된 PC입니다.")
+         if agent.status == "active" and agent.token_hash == t_hash:
+             agent.last_seen = time.time()
+-            agent.ip = client_ip
++            agent.ip = ip
+             db.commit()
+             return {"status": "active", "ring": agent.ring}
++        if agent.status == "pending" and agent.token_hash == t_hash:
++            # 승인 대기 중 주기적 재요청: 응답 시각만 갱신 (승인 시 '통신 확인'에 사용)
++            agent.last_seen = time.time()
++            agent.ip = ip
++            agent.hostname = req.hostname
++            db.commit()
++            return {"status": "pending", "message": "콘솔 관리자의 승인을 기다리는 중입니다."}
+ 
++        was_active = agent.status == "active"
+         agent.hostname = req.hostname
+         agent.os_name = req.os_name
+         agent.os_build = req.os_build
+-        agent.ip = client_ip
++        agent.ip = ip
+         agent.token_hash = t_hash
+         agent.token_preview = preview
+         agent.agent_ver = req.agent_ver
+         agent.status = "pending"
+         agent.last_seen = time.time()
+         log_event(db, req.hostname, f"에이전트 재등록 요청 (토큰: {preview})")
++        notify_console(
++            db, "warn" if was_active else "info", "register",
++            f"재등록 요청: {req.hostname}",
++            "등록된 PC가 새 토큰으로 재등록을 요청했습니다. 본인 PC가 맞는지 확인 후 승인하세요."
++            if was_active else "승인 대기 PC 목록에서 확인하세요.",
++            req.machine_id,
++        )
++        if was_active:
++            close_agent_stream(req.machine_id)
+     else:
+         agent = Agent(
+             machine_id=req.machine_id,
+             hostname=req.hostname,
+-            ip=client_ip,
++            ip=ip,
+             os_name=req.os_name,
+             os_build=req.os_build,
+             token_hash=t_hash,
+@@ -223,12 +399,83 @@ def register_agent(req: RegisterRequest, request: Request, db: Session = Depends
+         )
+         db.add(agent)
+         log_event(db, req.hostname, f"신규 PC 등록 대기 ({req.os_name} / {req.os_build})")
++        notify_console(db, "info", "register", f"신규 PC 등록 요청: {req.hostname}",
++                       f"{req.os_name} / {req.os_build} · {ip}", req.machine_id)
+ 
+     db.commit()
+     return {"status": "pending", "message": "콘솔 관리자의 승인을 기다리는 중입니다."}
+ 
+ 
+-@app.post("/api/agents/checkin")
++def _hist_key(h: dict) -> tuple:
++    return (h.get("id") or h.get("kb") or h.get("title") or "", h.get("date") or "", h.get("op"))
++
++
++def _merge_history(stored: list, incoming: list, replace: bool) -> list:
++    """설치(op=1)/제거(op=2) 이력만 보관, 날짜 내림차순 최대 HISTORY_KEEP 건"""
++    incoming = [h for h in incoming if h.get("op") in (1, 2)]
++    merged = {} if replace else {_hist_key(h): h for h in stored}
++    for h in incoming:
++        merged[_hist_key(h)] = h
++    return sorted(merged.values(), key=lambda h: h.get("date") or "", reverse=True)[:HISTORY_KEEP]
++
++
++def _store_reg_changes(db: Session, agent: Agent, changes: list[dict]):
++    added = 0
++    for ch in changes[:200]:
++        cid = str(ch.get("cid") or "")[:64]
++        path = str(ch.get("path") or "")
++        if not cid or not path.upper().startswith(POLICY_ROOT):
++            continue
++        if db.query(RegistryChange.id).filter(RegistryChange.cid == cid).first():
++            continue
++        db.add(
++            RegistryChange(
++                machine_id=agent.machine_id,
++                cid=cid,
++                ts=float(ch.get("ts") or time.time()),
++                source=str(ch.get("source") or "policy")[:16],
++                policy_hash=str(ch.get("policy_hash") or "")[:32],
++                path=path[:512],
++                name=str(ch.get("name") or "")[:256],
++                op=str(ch.get("op") or "set")[:16],
++                old_exists=bool(ch.get("old_exists")),
++                old_type=ch.get("old_type"),
++                old_value=json.dumps(ch.get("old_value"), ensure_ascii=False),
++                new_exists=bool(ch.get("new_exists", True)),
++                new_type=ch.get("new_type"),
++                new_value=json.dumps(ch.get("new_value"), ensure_ascii=False),
++            )
++        )
++        added += 1
++    if added:
++        db.flush()
++        keep_ids = [
++            r.id
++            for r in db.query(RegistryChange.id)
++            .filter(RegistryChange.machine_id == agent.machine_id)
++            .order_by(RegistryChange.ts.desc())
++            .limit(REGISTRY_CHANGE_KEEP)
++            .all()
++        ]
++        db.query(RegistryChange).filter(
++            RegistryChange.machine_id == agent.machine_id, ~RegistryChange.id.in_(keep_ids)
++        ).delete(synchronize_session=False)
++
++
++RESULT_CATEGORY = {"policy": "policy", "reg_rollback": "rollback"}
++RESULT_TITLE = {
++    "policy": "정책 적용 실패",
++    "reg_rollback": "레지스트리 롤백",
++    "update": "업데이트 작업 실패",
++    "install_all": "업데이트 설치 실패",
++    "single_kb": "KB 단독 작업 실패",
++    "reboot": "원격 재부팅 실패",
++    "shutdown": "원격 종료 실패",
++    "history_full": "전체 이력 조회 실패",
++}
++
++
++@app.post("/api/agents/checkin", dependencies=[Depends(require_ready)])
+ def agent_checkin(
+     req: CheckinRequest,
+     request: Request,
+@@ -236,15 +483,15 @@ def agent_checkin(
+     db: Session = Depends(get_db),
+ ):
+     """승인된 에이전트의 정기/즉시 상태 보고 및 명령/정책 수신"""
++    now = time.time()
+     agent.hostname = req.hostname
+     if req.os_name:
+         agent.os_name = req.os_name
+     if req.os_build:
+         agent.os_build = req.os_build
+-    if request.client:
+-        agent.ip = request.client.host
++    agent.ip = client_ip(request)
+ 
+-    agent.last_seen = time.time()
++    agent.last_seen = now
+     agent.applied_hash = req.applied_hash
+     agent.reboot_required = req.reboot_required
+     agent.hotfix = req.hotfix
+@@ -257,16 +504,45 @@ def agent_checkin(
+     if req.ram_gb:
+         agent.ram_gb = req.ram_gb
+ 
++    if req.reg_changes:
++        _store_reg_changes(db, agent, req.reg_changes)
++
+     for r in req.results:
+-        status_txt = "OK" if r.get("ok") else "FAIL"
+-        log_event(db, agent.hostname, f"{status_txt} [{r.get('type')}]: {r.get('out', '')}")
++        rtype = str(r.get("type"))
++        ok = bool(r.get("ok"))
++        out = str(r.get("out", ""))
++        log_event(db, agent.hostname, f"{'OK' if ok else 'FAIL'} [{rtype}]: {out}")
++
++        if rtype == "reg_rollback" and r.get("ref"):
++            ch = db.query(RegistryChange).filter(
++                RegistryChange.id == int(r["ref"]), RegistryChange.machine_id == agent.machine_id
++            ).first()
++            if ch:
++                ch.rollback_state = "done" if ok else "failed"
++                ch.rollback_ts = now
++                ch.rollback_msg = out[:256]
++            notify_console(
++                db, "info" if ok else "error", "rollback",
++                f"{RESULT_TITLE['reg_rollback']} {'완료' if ok else '실패'}: {agent.hostname}", out, agent.machine_id,
++            )
++        elif not ok:
++            notify_console(
++                db, "error", RESULT_CATEGORY.get(rtype, "command"),
++                f"{RESULT_TITLE.get(rtype, '명령 실행 실패')}: {agent.hostname}", out, agent.machine_id,
++            )
+ 
+     if req.updates is not None:
+         agent.pend_json = json.dumps(req.updates, ensure_ascii=False)
+-        agent.upd_ts = time.time()
+-    if req.history is not None:
+-        agent.hist_json = json.dumps(req.history, ensure_ascii=False)
+-
++        agent.upd_ts = now
++    if req.history_full is not None:
++        agent.hist_json = json.dumps(_merge_history([], req.history_full, replace=True), ensure_ascii=False)
++        agent.hist_ts = now
++    elif req.history is not None:
++        stored = json.loads(agent.hist_json or "[]")
++        agent.hist_json = json.dumps(_merge_history(stored, req.history[:30], replace=False), ensure_ascii=False)
++        agent.hist_ts = now
++
++    # 큐에 쌓인 명령 전달: TTL이 지난 명령(오프라인 중 적재 등)은 실행하지 않고 폐기
+     queued_cmds = (
+         db.query(AgentCommand)
+         .filter(AgentCommand.machine_id == agent.machine_id, AgentCommand.status == "queued")
+@@ -275,11 +551,10 @@ def agent_checkin(
+     )
+     commands_out = []
+     for c in queued_cmds:
+-        commands_out.append({
+-            "id": c.id,
+-            "type": c.cmd_type,
+-            "payload": json.loads(c.payload_json or "{}"),
+-        })
++        if now - (c.created_at or 0) <= COMMAND_TTL_SEC:
++            commands_out.append({"id": c.id, "type": c.cmd_type, "payload": json.loads(c.payload_json or "{}")})
++        else:
++            log_event(db, agent.hostname, f"만료된 명령 폐기 [{c.cmd_type}] (적재 후 {int(now - c.created_at)}초 경과)")
+         db.delete(c)
+ 
+     pol_row = db.query(Policy).filter(Policy.ring == agent.ring).first()
+@@ -305,16 +580,16 @@ async def agent_realtime_stream(
+     machine_id: str,
+     x_agent_token: str = Header(default=""),
+ ):
+-    """승인된 에이전트와 상시 연결되는 실시간 정책/명령 푸시 채널
+-
+-    - DB 세션은 인증 확인에만 잠깐 쓰고 반환한다. (기존: 스트림 수명 동안 커넥션 점유 →
+-      연결 PC가 풀 크기(기본 15)를 넘으면 체크인 API가 멈추는 문제)
+-    - 동기 DB 조회는 스레드풀에서 실행해 이벤트 루프를 막지 않는다.
+-    """
++    """승인된 에이전트와 상시 연결되는 실시간 정책/명령 푸시 채널"""
++    if not get_status()["ready"]:
++        raise HTTPException(status_code=503, detail="서버 준비 중")
+     ok = await run_in_threadpool(_verify_stream_agent, machine_id, x_agent_token)
+     if not ok:
+         raise HTTPException(status_code=401, detail="미승인 또는 유효하지 않은 에이전트 토큰")
+ 
++    old = AGENT_STREAMS.get(machine_id)
++    if old:  # 같은 PC의 이전 연결은 종료
++        close_agent_stream(machine_id)
+     q: asyncio.Queue = asyncio.Queue(maxsize=8)
+     AGENT_STREAMS[machine_id] = (asyncio.get_running_loop(), q)
+ 
+@@ -324,6 +599,8 @@ async def agent_realtime_stream(
+             while True:
+                 try:
+                     msg = await asyncio.wait_for(q.get(), timeout=20.0)
++                    if msg.get("type") == "close":
++                        break
+                     yield f"data: {json.dumps(msg)}\n\n"
+                 except asyncio.TimeoutError:
+                     yield ": keepalive\n\n"
+@@ -335,7 +612,7 @@ async def agent_realtime_stream(
+     return StreamingResponse(event_generator(), media_type="text/event-stream")
+ 
+ 
+-@app.post("/api/agent/shutdown")
++@app.post("/api/agent/shutdown", dependencies=[Depends(require_ready)])
+ def agent_shutdown_log(
+     payload: dict,
+     x_agent_token: str = Header(default=""),
+@@ -346,54 +623,125 @@ def agent_shutdown_log(
+     reason = payload.get("reason", "관리자/사용자 트레이 완전 종료")
+     agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
+ 
+-    if agent and agent.token_hash == hash_token(x_agent_token):
++    if agent and secrets.compare_digest(agent.token_hash, hash_token(x_agent_token)):
+         agent.last_seen = 0
+         log_event(db, agent.hostname, f"에이전트 완전 종료 보고 ({reason})")
++        notify_console(db, "warn", "agent", f"에이전트 종료됨: {agent.hostname}", reason, machine_id)
+         db.commit()
++        close_agent_stream(machine_id)
++    return {"ok": True}
++
++
++# ==========================================
++# 2. 관리자 로그인 / 계정
++# ==========================================
++
++@app.post("/api/auth/login", dependencies=[Depends(check_admin_ip)])
++def login(req: LoginRequest, request: Request):
++    ip = client_ip(request)
++    ok, msg, must_change = accounts.authenticate(req.username, req.password, ip)
++    write_access_log(req.username, ip, "login" if ok else "login_fail", ok, "" if ok else msg)
++    if not ok:
++        if accounts.is_locked_out(req.username, ip) and get_status()["ready"]:
++            with SessionLocal() as db:
++                notify_console(db, "warn", "security", "콘솔 로그인 잠금",
++                               f"계정 '{req.username[:32]}' / {ip} 에서 로그인 실패가 반복되어 5분간 잠겼습니다.")
++                db.commit()
++        raise HTTPException(status_code=401, detail=msg)
++    token = accounts.create_session(req.username.strip(), ip)
++    return {"token": token, "username": req.username.strip(), "must_change": must_change}
++
++
++@app.post("/api/auth/logout")
++def logout(request: Request, user: dict = Depends(current_admin)):
++    accounts.delete_session(user["token"])
++    write_access_log(user["username"], client_ip(request), "logout", True)
+     return {"ok": True}
+ 
+ 
++@app.get("/api/auth/me")
++def me(user: dict = Depends(current_admin)):
++    return {"username": user["username"], "must_change": user["must_change"]}
++
++
++@app.post("/api/auth/password")
++def change_password(req: PasswordChangeRequest, request: Request, user: dict = Depends(current_admin)):
++    ok, msg = accounts.change_password(user["username"], req.current_password, req.new_password, user["token"])
++    write_access_log(user["username"], client_ip(request), "password_change", ok, "" if ok else msg)
++    if not ok:
++        raise HTTPException(status_code=400, detail=msg)
++    return {"ok": True, "message": msg}
++
++
++@app.get("/api/system/status")
++def system_status(_: dict = Depends(current_admin)):
++    """로그인 직후 로딩 화면용: DB 백업/마이그레이션 진행 상황"""
++    st = get_status()
++    st["backup_file"] = os.path.basename(st.get("backup_file") or "")
++    return st
++
++
++@app.get("/api/access-logs", dependencies=ADMIN_DEPS)
++def list_access_logs(db: Session = Depends(get_db)):
++    rows = db.query(AccessLog).order_by(AccessLog.id.desc()).limit(200).all()
++    return [
++        {"id": r.id, "ts": r.ts, "username": r.username, "ip": r.ip, "action": r.action, "ok": r.ok,
++         "detail": r.detail}
++        for r in rows
++    ]
++
++
+ # ==========================================
+-# 2. 관리자 콘솔 API (프론트엔드 연동)
++# 3. 관리자 콘솔 API
+ # ==========================================
+ 
+-@app.get("/api/state", dependencies=[Depends(verify_admin)])
++def _serialize_agent(a: Agent, pol_dict: dict, now: float) -> dict:
++    pend = json.loads(a.pend_json or "[]")
++    return {
++        "machine_id": a.machine_id,
++        "hostname": a.hostname,
++        "ip": a.ip,
++        "os_name": a.os_name,
++        "os_build": a.os_build,
++        "mac_addr": a.mac_addr or "-",
++        "cpu_info": a.cpu_info or "-",
++        "ram_gb": a.ram_gb or "-",
++        "token_preview": a.token_preview,
++        "status": a.status,
++        "ring": a.ring,
++        "last_seen": a.last_seen,
++        "online": is_online(a, now),
++        "alive": (now - (a.last_seen or 0)) < PENDING_ALIVE_SEC,
++        "applied_hash": a.applied_hash,
++        "target_hash": pol_dict.get(a.ring, {}).get("hash"),
++        "reboot_required": a.reboot_required,
++        "hotfix": a.hotfix,
++        "agent_ver": a.agent_ver,
++        "pend": pend,
++        "upd_ts": a.upd_ts,
++        # 이력 본문은 상세 모달(/api/agents/{id}/detail)에서만 조회
++        "hist_count": len(json.loads(a.hist_json or "[]")),
++    }
++
++
++@app.get("/api/state", dependencies=ADMIN_DEPS)
+ def get_dashboard_state(db: Session = Depends(get_db)):
++    now = time.time()
+     pol_dict = {}
+     for p in db.query(Policy).all():
+         items = json.loads(p.items_json or "[]")
+         pol_dict[p.ring] = {"items": items, "hash": policy_hash(items)}
+ 
+-    def serialize_agent(a: Agent):
+-        return {
+-            "machine_id": a.machine_id,
+-            "hostname": a.hostname,
+-            "ip": a.ip,
+-            "os_name": a.os_name,
+-            "os_build": a.os_build,
+-            "mac_addr": getattr(a, "mac_addr", None) or "-",
+-            "cpu_info": getattr(a, "cpu_info", None) or "-",
+-            "ram_gb": getattr(a, "ram_gb", None) or "-",
+-            "token_preview": a.token_preview,
+-            "status": a.status,
+-            "ring": a.ring,
+-            "last_seen": a.last_seen,
+-            "applied_hash": a.applied_hash,
+-            "target_hash": pol_dict.get(a.ring, {}).get("hash"),
+-            "reboot_required": a.reboot_required,
+-            "hotfix": a.hotfix,
+-            "agent_ver": a.agent_ver,
+-            "pend": json.loads(a.pend_json or "[]"),
+-            "hist": json.loads(a.hist_json or "[]"),
+-            "upd_ts": a.upd_ts,
+-        }
+-
+     raw_active = db.query(Agent).filter(Agent.status == "active").order_by(Agent.hostname).all()
+-    active_agents = [serialize_agent(a) for a in raw_active]
++    active_agents = [_serialize_agent(a, pol_dict, now) for a in raw_active]
+     pending_agents = [
+-        serialize_agent(a)
++        _serialize_agent(a, pol_dict, now)
+         for a in db.query(Agent).filter(Agent.status == "pending").order_by(Agent.last_seen.desc()).all()
+     ]
++    rejected_agents = [
++        _serialize_agent(a, pol_dict, now)
++        for a in db.query(Agent).filter(Agent.status == "rejected").order_by(Agent.hostname).all()
++    ]
+     rules = [
+         {"kb": r.kb, "ring": r.ring, "action": r.action, "note": r.note}
+         for r in db.query(KbRule).order_by(KbRule.kb).all()
+@@ -405,10 +753,6 @@ def get_dashboard_state(db: Session = Depends(get_db)):
+ 
+     # 수집된 Windows 11 업데이트 카탈로그 + 사내 설치/대기 대수 집계
+     catalog_rows = db.query(UpdateCatalog).order_by(UpdateCatalog.updated_at.desc()).limit(100).all()
+-
+-    # PC별 설치 완료/대기 KB 집합을 한 번만 계산
+-    # - 설치: hotfix 목록(길이 제한 없음) + 이력 중 설치 성공(op=1, rc=2/3) 항목
+-    # - 정확히 일치하는 KB만 집계 (기존 부분 문자열 비교로 인한 오집계 제거)
+     installed_sets: list[set[str]] = []
+     pending_sets: list[set[str]] = []
+     for a in raw_active:
+@@ -424,8 +768,6 @@ def get_dashboard_state(db: Session = Depends(get_db)):
+     catalog_list = []
+     for c in catalog_rows:
+         kb = (c.kb or "").upper()
+-        installed_cnt = sum(1 for s_ in installed_sets if kb in s_)
+-        pending_cnt = sum(1 for s_ in pending_sets if kb in s_)
+         catalog_list.append({
+             "kb": c.kb,
+             "title": c.title,
+@@ -433,23 +775,137 @@ def get_dashboard_state(db: Session = Depends(get_db)):
+             "summary": c.summary,
+             "release_date": c.release_date,
+             "source": c.source,
+-            "installed_count": installed_cnt,
+-            "pending_count": pending_cnt,
++            "installed_count": sum(1 for s_ in installed_sets if kb in s_),
++            "pending_count": sum(1 for s_ in pending_sets if kb in s_),
+         })
+ 
+     return {
+-        "now": time.time(),
++        "now": now,
+         "agents": active_agents,
+         "pending_agents": pending_agents,
++        "rejected_agents": rejected_agents,
+         "policies": pol_dict,
+         "rules": rules,
+         "events": events,
+         "catalog": catalog_list,
++        "notification_count": db.query(Notification).count(),
+         "defaults": {"target_release": DEFAULT_TARGET_RELEASE},
++        "server": {"host": SERVER_CONFIG["host"], "port": SERVER_CONFIG["port"]},
++        "limits": {"online_sec": ONLINE_WINDOW_SEC, "pending_alive_sec": PENDING_ALIVE_SEC,
++                   "retention_days": RETENTION_DAYS, "history_keep": HISTORY_KEEP},
++    }
++
++
++def _get_agent_or_404(db: Session, machine_id: str) -> Agent:
++    agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
++    if not agent:
++        raise HTTPException(status_code=404, detail="대상 PC를 찾을 수 없습니다.")
++    return agent
++
++
++@app.get("/api/agents/{machine_id}/detail", dependencies=ADMIN_DEPS)
++def agent_detail(machine_id: str, db: Session = Depends(get_db)):
++    """상세 모달 전용: 업데이트 이력(최대 100건) + 레지스트리 변경 이력"""
++    agent = _get_agent_or_404(db, machine_id)
++    changes = (
++        db.query(RegistryChange)
++        .filter(RegistryChange.machine_id == machine_id)
++        .order_by(RegistryChange.ts.desc())
++        .limit(100)
++        .all()
++    )
++    return {
++        "machine_id": agent.machine_id,
++        "online": is_online(agent),
++        "hist": json.loads(agent.hist_json or "[]")[:HISTORY_KEEP],
++        "hist_ts": agent.hist_ts,
++        "registry_changes": [
++            {
++                "id": c.id, "ts": c.ts, "source": c.source, "policy_hash": c.policy_hash,
++                "path": c.path, "name": c.name, "op": c.op,
++                "old_exists": c.old_exists, "old_type": c.old_type, "old_value": json.loads(c.old_value or "null"),
++                "new_exists": c.new_exists, "new_type": c.new_type, "new_value": json.loads(c.new_value or "null"),
++                "rollback_state": c.rollback_state, "rollback_ts": c.rollback_ts, "rollback_msg": c.rollback_msg,
++            }
++            for c in changes
++        ],
+     }
+ 
+ 
+-@app.post("/api/catalog/sync", dependencies=[Depends(verify_admin)])
++def _queue_if_online(db: Session, agent: Agent, cmd_type: str, payload: dict) -> bool:
++    """대상 PC가 온라인일 때만 명령을 적재 (오프라인이면 적재하지 않음)"""
++    if agent.status != "active" or not is_online(agent):
++        return False
++    db.add(AgentCommand(machine_id=agent.machine_id, cmd_type=cmd_type,
++                        payload_json=json.dumps(payload, ensure_ascii=False), created_at=time.time()))
++    return True
++
++
++@app.post("/api/agents/{machine_id}/history/refresh", dependencies=ADMIN_DEPS)
++def refresh_history(machine_id: str, db: Session = Depends(get_db)):
++    """상세 모달을 열 때 호출: 에이전트에 전체 설치/제거 이력(최대 100건) 재보고 요청"""
++    agent = _get_agent_or_404(db, machine_id)
++    queued = _queue_if_online(db, agent, "report_history", {})
++    db.commit()
++    if queued:
++        notify_agent_realtime(machine_id, "command")
++    return {"ok": True, "queued": queued}
++
++
++@app.post("/api/agents/{machine_id}/registry/{change_id}/rollback", dependencies=ADMIN_DEPS)
++def rollback_registry_change(machine_id: str, change_id: int, db: Session = Depends(get_db)):
++    agent = _get_agent_or_404(db, machine_id)
++    ch = db.query(RegistryChange).filter(
++        RegistryChange.id == change_id, RegistryChange.machine_id == machine_id
++    ).first()
++    if not ch:
++        raise HTTPException(status_code=404, detail="변경 이력을 찾을 수 없습니다.")
++    if not ch.path.upper().startswith(POLICY_ROOT):
++        raise HTTPException(status_code=400, detail="허용되지 않은 레지스트리 경로입니다.")
++    if ch.rollback_state == "requested":
++        raise HTTPException(status_code=409, detail="이미 롤백을 요청한 항목입니다.")
++    payload = {
++        "ref": ch.id,
++        "path": ch.path,
++        "name": ch.name,
++        "restore_exists": ch.old_exists,
++        "restore_type": ch.old_type,
++        "restore_value": json.loads(ch.old_value or "null"),
++    }
++    if not _queue_if_online(db, agent, "reg_rollback", payload):
++        raise HTTPException(status_code=409, detail="PC가 오프라인 상태라 롤백 명령을 보낼 수 없습니다.")
++    ch.rollback_state = "requested"
++    ch.rollback_ts = time.time()
++    ch.rollback_msg = ""
++    log_event(db, "console", f"레지스트리 롤백 요청: {agent.hostname} {ch.path}\\{ch.name}")
++    db.commit()
++    notify_agent_realtime(machine_id, "command")
++    return {"ok": True}
++
++
++@app.get("/api/notifications", dependencies=ADMIN_DEPS)
++def list_notifications(db: Session = Depends(get_db)):
++    rows = db.query(Notification).order_by(Notification.id.desc()).limit(300).all()
++    return [
++        {"id": n.id, "ts": n.ts, "level": n.level, "category": n.category, "title": n.title,
++         "message": n.message, "machine_id": n.machine_id}
++        for n in rows
++    ]
++
++
++@app.post("/api/notifications/ack", dependencies=ADMIN_DEPS)
++def ack_notifications(payload: dict, db: Session = Depends(get_db)):
++    """확인한 알림은 보관하지 않고 즉시 삭제 (ids 미지정 시 전체 확인)"""
++    ids = payload.get("ids")
++    q = db.query(Notification)
++    if ids:
++        q = q.filter(Notification.id.in_([int(i) for i in ids]))
++    removed = q.delete(synchronize_session=False)
++    db.commit()
++    return {"ok": True, "removed": removed}
++
++
++@app.post("/api/catalog/sync", dependencies=ADMIN_DEPS)
+ def trigger_catalog_sync(db: Session = Depends(get_db)):
+     added = sync_catalog_database(db, fetch_online=True)
+     log_event(db, "console", f"Windows 11 업데이트 카탈로그 동기화 완료 (신규 {added}건)")
+@@ -457,16 +913,21 @@ def trigger_catalog_sync(db: Session = Depends(get_db)):
+     return {"ok": True, "added": added}
+ 
+ 
+-@app.post("/api/agents/{machine_id}/decision", dependencies=[Depends(verify_admin)])
++@app.post("/api/agents/{machine_id}/decision", dependencies=ADMIN_DEPS)
+ def decide_pending_agent(machine_id: str, req: DecisionRequest, db: Session = Depends(get_db)):
+-    agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
+-    if not agent:
+-        raise HTTPException(status_code=404, detail="대상 PC를 찾을 수 없습니다.")
++    agent = _get_agent_or_404(db, machine_id)
+ 
+     if req.approve:
++        # 승인 전 통신 확인: 승인 대기 중인 에이전트는 15초마다 등록 요청을 보내므로
++        # 최근 PENDING_ALIVE_SEC 이내에 요청이 없으면 에이전트가 응답하지 않는 것으로 판단
++        if time.time() - (agent.last_seen or 0) > PENDING_ALIVE_SEC:
++            raise HTTPException(
++                status_code=409,
++                detail=f"{agent.hostname} 에이전트의 응답이 없습니다. PC 전원과 에이전트 서비스 상태를 확인한 뒤 다시 시도하세요.",
++            )
+         agent.status = "active"
+         agent.ring = req.ring
+-        db.add(AgentCommand(machine_id=agent.machine_id, cmd_type="scan", payload_json="{}"))
++        db.add(AgentCommand(machine_id=agent.machine_id, cmd_type="scan", payload_json="{}", created_at=time.time()))
+         log_event(db, "console", f"에이전트 승인 완료: {agent.hostname} ({req.ring})")
+     else:
+         agent.status = "rejected"
+@@ -475,39 +936,48 @@ def decide_pending_agent(machine_id: str, req: DecisionRequest, db: Session = De
+     db.commit()
+     if req.approve:
+         notify_agent_realtime(machine_id, "approved")
++    else:
++        close_agent_stream(machine_id)
+     return {"ok": True}
+ 
+ 
+-@app.post("/api/agents/{machine_id}/revoke", dependencies=[Depends(verify_admin)])
++@app.post("/api/agents/{machine_id}/unreject", dependencies=ADMIN_DEPS)
++def unreject_agent(machine_id: str, db: Session = Depends(get_db)):
++    """거부 PC 목록에서 제거 → 승인 대기로 되돌림 (에이전트의 다음 등록 요청부터 '응답 확인됨'으로 표시)"""
++    agent = _get_agent_or_404(db, machine_id)
++    if agent.status != "rejected":
++        raise HTTPException(status_code=400, detail="거부 상태인 PC가 아닙니다.")
++    agent.status = "pending"
++    log_event(db, "console", f"거부 해제 → 승인 대기 전환: {agent.hostname}")
++    db.commit()
++    return {"ok": True}
++
++
++@app.post("/api/agents/{machine_id}/revoke", dependencies=ADMIN_DEPS)
+ def revoke_agent_token(machine_id: str, db: Session = Depends(get_db)):
+-    agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
+-    if not agent:
+-        raise HTTPException(status_code=404, detail="대상 PC를 찾을 수 없습니다.")
++    agent = _get_agent_or_404(db, machine_id)
+     agent.status = "pending"
+     agent.token_hash = "REVOKED"
+     log_event(db, "console", f"토큰 폐기 및 재인증 대기 전환: {agent.hostname}")
+     db.commit()
+-    AGENT_STREAMS.pop(machine_id, None)
++    close_agent_stream(machine_id)
+     return {"ok": True}
+ 
+ 
+-@app.delete("/api/agents/{machine_id}", dependencies=[Depends(verify_admin)])
++@app.delete("/api/agents/{machine_id}", dependencies=ADMIN_DEPS)
+ def delete_agent(machine_id: str, db: Session = Depends(get_db)):
+-    agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
+-    if not agent:
+-        raise HTTPException(status_code=404, detail="대상 PC를 찾을 수 없습니다.")
+-
++    agent = _get_agent_or_404(db, machine_id)
+     hostname = agent.hostname
+     db.query(AgentCommand).filter(AgentCommand.machine_id == machine_id).delete()
++    db.query(RegistryChange).filter(RegistryChange.machine_id == machine_id).delete()
+     db.delete(agent)
+     log_event(db, "console", f"관리 대상 PC 영구 삭제 완료: {hostname} ({machine_id})")
+     db.commit()
+-
+-    AGENT_STREAMS.pop(machine_id, None)
++    close_agent_stream(machine_id)
+     return {"ok": True}
+ 
+ 
+-@app.post("/api/agents/{machine_id}/ring", dependencies=[Depends(verify_admin)])
++@app.post("/api/agents/{machine_id}/ring", dependencies=ADMIN_DEPS)
+ def change_agent_ring(machine_id: str, req: RingChangeRequest, db: Session = Depends(get_db)):
+     agent = db.query(Agent).filter(Agent.machine_id == machine_id).first()
+     if not agent:
+@@ -519,7 +989,7 @@ def change_agent_ring(machine_id: str, req: RingChangeRequest, db: Session = Dep
+     return {"ok": True}
+ 
+ 
+-@app.post("/api/policies", dependencies=[Depends(verify_admin)])
++@app.post("/api/policies", dependencies=ADMIN_DEPS)
+ def save_policy(req: PolicySaveRequest, db: Session = Depends(get_db)):
+     pol = db.query(Policy).filter(Policy.ring == req.ring).first()
+     if not pol:
+@@ -532,7 +1002,7 @@ def save_policy(req: PolicySaveRequest, db: Session = Depends(get_db)):
+     return {"ok": True}
+ 
+ 
+-@app.post("/api/rings", dependencies=[Depends(verify_admin)])
++@app.post("/api/rings", dependencies=ADMIN_DEPS)
+ def create_ring(payload: dict, db: Session = Depends(get_db)):
+     ring_name = str(payload.get("ring", "")).strip()
+     if not ring_name or ring_name == "*":
+@@ -550,7 +1020,7 @@ def create_ring(payload: dict, db: Session = Depends(get_db)):
+     return {"ok": True}
+ 
+ 
+-@app.delete("/api/rings/{ring_name}", dependencies=[Depends(verify_admin)])
++@app.delete("/api/rings/{ring_name}", dependencies=ADMIN_DEPS)
+ def delete_ring(ring_name: str, db: Session = Depends(get_db)):
+     if ring_name in ("ring0", "ring1"):
+         raise HTTPException(status_code=400, detail="기본 링(ring0, ring1)은 삭제할 수 없습니다.")
+@@ -564,7 +1034,7 @@ def delete_ring(ring_name: str, db: Session = Depends(get_db)):
+     return {"ok": True}
+ 
+ 
+-@app.put("/api/rings/{old_ring}", dependencies=[Depends(verify_admin)])
++@app.put("/api/rings/{old_ring}", dependencies=ADMIN_DEPS)
+ def rename_ring(old_ring: str, payload: dict, db: Session = Depends(get_db)):
+     new_ring = str(payload.get("new_ring", "")).strip()
+     if not new_ring or new_ring == "*":
+@@ -586,7 +1056,7 @@ def rename_ring(old_ring: str, payload: dict, db: Session = Depends(get_db)):
+     return {"ok": True}
+ 
+ 
+-@app.post("/api/rules", dependencies=[Depends(verify_admin)])
++@app.post("/api/rules", dependencies=ADMIN_DEPS)
+ def manage_kb_rule(req: RuleRequest, db: Session = Depends(get_db)):
+     kb = req.kb.upper().strip()
+     if not re.fullmatch(r"KB\d{5,8}", kb) or req.action not in ("block", "allow", "install", "none"):
+@@ -610,33 +1080,37 @@ def manage_kb_rule(req: RuleRequest, db: Session = Depends(get_db)):
+     return {"ok": True}
+ 
+ 
+-@app.post("/api/commands", dependencies=[Depends(verify_admin)])
++
++
++VALID_COMMANDS = {"scan", "install_all", "install_kb", "hide_kb", "unhide_kb", "reboot", "shutdown"}
++
++
++@app.post("/api/commands", dependencies=ADMIN_DEPS)
+ def dispatch_commands(req: CommandRequest, db: Session = Depends(get_db)):
+-    valid_types = {"scan", "install_all", "install_kb", "hide_kb", "unhide_kb", "reboot", "shutdown"}
+-    if req.type not in valid_types:
++    """온라인 PC에만 명령 적재. 오프라인 PC는 대기열에 넣지 않고 건너뛴 목록으로 반환"""
++    if req.type not in VALID_COMMANDS:
+         raise HTTPException(status_code=400, detail="지원하지 않는 명령 유형입니다.")
+ 
+-    count = 0
+-    dispatched_ids = []
++    dispatched_ids, skipped = [], []
+     for mid in req.machine_ids:
+         agent = db.query(Agent).filter(Agent.machine_id == mid, Agent.status == "active").first()
+-        if agent:
+-            db.add(
+-                AgentCommand(
+-                    machine_id=mid,
+-                    cmd_type=req.type,
+-                    payload_json=json.dumps(req.payload, ensure_ascii=False),
+-                )
+-            )
+-            count += 1
++        if not agent:
++            continue
++        if _queue_if_online(db, agent, req.type, req.payload):
+             dispatched_ids.append(mid)
++        else:
++            skipped.append(agent.hostname)
+ 
+     detail = f" ({req.payload.get('kb')})" if req.payload.get("kb") else ""
+-    log_event(db, "console", f"명령 전송 [{req.type}{detail}] → {count}대")
++    msg = f"명령 전송 [{req.type}{detail}] → {len(dispatched_ids)}대"
++    if skipped:
++        msg += f" / 오프라인 제외 {len(skipped)}대: {', '.join(skipped[:10])}{' 외' if len(skipped) > 10 else ''}"
++    log_event(db, "console", msg)
+     db.commit()
+     for mid in dispatched_ids:
+         notify_agent_realtime(mid, "command")
+-    return {"ok": True, "dispatched": count}
++    return {"ok": True, "dispatched": len(dispatched_ids), "skipped": skipped}
++
+ 
+ 
+ # ==========================================
+diff --git a/backend/app/migrations.py b/backend/app/migrations.py
+new file mode 100644
+index 0000000..171cd92
+--- /dev/null
++++ b/backend/app/migrations.py
+@@ -0,0 +1,164 @@
++"""시작 시 DB 백업 → 스키마 비교 → 새 구조로 테이블 재생성 + 기존 데이터 복사
++
++- 서버가 켜지면 백그라운드 스레드에서 실행되고, 진행 상황은 STATUS 로 노출된다.
++  (콘솔은 로그인 직후 /api/system/status 를 조회해 로딩 화면에 단계 메시지를 보여준다)
++- 완료 전까지 에이전트/관리 API는 503(준비 중)을 반환하며, 에이전트는 자동으로 재시도한다.
++- SQLite 권장 절차(새 테이블 생성 → 데이터 복사 → 기존 테이블 삭제 → 이름 변경)를 따른다.
++"""
++import datetime
++import glob
++import os
++import sqlite3
++import threading
++import time
++
++from sqlalchemy import inspect, text
++from sqlalchemy.schema import CreateTable
++
++from .database import BASE_DIR, DATABASE_URL, Base, engine
++
++SCHEMA_VERSION = 2
++BACKUP_DIR = os.path.join(BASE_DIR, "backups")
++BACKUP_KEEP = 10
++
++_status_lock = threading.Lock()
++STATUS = {
++    "ready": False,
++    "phase": "starting",
++    "message": "관제 서버를 시작하는 중입니다...",
++    "steps": [],
++    "error": "",
++    "backup_file": "",
++    "rebuilt_tables": [],
++    "started_at": time.time(),
++    "finished_at": None,
++}
++
++
++def _set(phase: str, message: str, **extra):
++    with _status_lock:
++        STATUS["phase"] = phase
++        STATUS["message"] = message
++        STATUS["steps"].append({"ts": time.time(), "phase": phase, "message": message})
++        STATUS.update(extra)
++
++
++def get_status() -> dict:
++    with _status_lock:
++        return {k: (list(v) if isinstance(v, list) else v) for k, v in STATUS.items()}
++
++
++def _sqlite_path() -> str:
++    return DATABASE_URL.replace("sqlite:///", "", 1) if DATABASE_URL.startswith("sqlite:///") else ""
++
++
++def backup_database() -> str:
++    """SQLite 온라인 백업 API로 일관된 사본을 만든다 (WAL 내용 포함)"""
++    src_path = _sqlite_path()
++    if not src_path or not os.path.exists(src_path):
++        return ""
++    os.makedirs(BACKUP_DIR, exist_ok=True)
++    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
++    dst_path = os.path.join(BACKUP_DIR, f"aurora_enterprise_{stamp}.db")
++    src = sqlite3.connect(src_path, timeout=30)
++    dst = sqlite3.connect(dst_path)
++    try:
++        src.backup(dst)
++    finally:
++        dst.close()
++        src.close()
++    # 오래된 백업 정리 (최근 BACKUP_KEEP 개 유지)
++    files = sorted(glob.glob(os.path.join(BACKUP_DIR, "aurora_enterprise_*.db")))
++    for old in files[:-BACKUP_KEEP]:
++        try:
++            os.remove(old)
++        except OSError:
++            pass
++    return dst_path
++
++
++def _rebuild_table(conn, table, existing_cols: list[str]) -> None:
++    name = table.name
++    tmp = f"{name}__new"
++    ddl = str(CreateTable(table).compile(engine)).strip()
++    ddl = ddl.replace(f"CREATE TABLE {name} ", f"CREATE TABLE {tmp} ", 1)
++    conn.execute(text(f"DROP TABLE IF EXISTS {tmp}"))
++    conn.execute(text(ddl))
++
++    model_cols = [c.name for c in table.columns]
++    common = [c for c in model_cols if c in existing_cols]
++    col_list = ", ".join(f'"{c}"' for c in common)
++    conn.execute(text(f"INSERT INTO {tmp} ({col_list}) SELECT {col_list} FROM {name}"))
++
++    # 새로 생긴 컬럼 중 파이썬 기본값(스칼라)이 있는 것은 채워 넣는다
++    for c in table.columns:
++        if c.name in existing_cols or c.default is None or not getattr(c.default, "is_scalar", False):
++            continue
++        conn.execute(text(f'UPDATE {tmp} SET "{c.name}" = :v WHERE "{c.name}" IS NULL'), {"v": c.default.arg})
++
++    conn.execute(text(f"DROP TABLE {name}"))
++    conn.execute(text(f"ALTER TABLE {tmp} RENAME TO {name}"))
++    for idx in table.indexes:
++        idx.create(conn, checkfirst=True)
++
++
++def migrate_schema() -> list[str]:
++    """모델과 실제 테이블의 컬럼 구성이 다르면 재생성. 재생성한 테이블 이름 목록 반환"""
++    rebuilt: list[str] = []
++    if not DATABASE_URL.startswith("sqlite"):
++        Base.metadata.create_all(bind=engine)
++        return rebuilt
++
++    with engine.connect() as conn:
++        # PRAGMA foreign_keys 는 트랜잭션 밖에서만 적용되므로 먼저 실행 후 커밋
++        conn.execute(text("PRAGMA foreign_keys=OFF"))
++        conn.execute(text("PRAGMA legacy_alter_table=OFF"))
++        insp = inspect(conn)
++        existing_tables = set(insp.get_table_names())
++        existing_cols_map = {t: [c["name"] for c in insp.get_columns(t)] for t in existing_tables}
++        conn.commit()
++        try:
++            with conn.begin():
++                for table in Base.metadata.sorted_tables:
++                    if table.name not in existing_tables:
++                        table.create(conn)
++                        continue
++                    existing_cols = existing_cols_map[table.name]
++                    if set(existing_cols) != {c.name for c in table.columns}:
++                        _rebuild_table(conn, table, existing_cols)
++                        rebuilt.append(table.name)
++                conn.execute(text(f"PRAGMA user_version={SCHEMA_VERSION}"))
++        finally:
++            conn.execute(text("PRAGMA foreign_keys=ON"))
++            conn.commit()
++    return rebuilt
++
++
++def run_startup(post_steps) -> None:
++    """백업 → 마이그레이션 → 후처리(post_steps: [(phase, message, fn)]) 순서로 실행"""
++    try:
++        _set("backup", "기존 DB를 백업하고 있습니다...")
++        backup = backup_database()
++        _set("backup", f"백업 완료: {os.path.basename(backup)}" if backup else "백업할 기존 DB가 없습니다 (신규 설치)",
++             backup_file=backup)
++
++        _set("migrate", "DB 구조를 확인하고 새 컬럼 구조로 데이터를 옮기는 중입니다...")
++        rebuilt = migrate_schema()
++        _set(
++            "migrate",
++            f"DB 구조 갱신 완료 ({', '.join(rebuilt)})" if rebuilt else "DB 구조가 최신 상태입니다",
++            rebuilt_tables=rebuilt,
++        )
++
++        for phase, message, fn in post_steps:
++            _set(phase, message)
++            fn()
++
++        _set("ready", "준비 완료", ready=True, finished_at=time.time())
++    except Exception as e:  # 실패 시 백업 파일로 복구할 수 있도록 경로를 안내
++        _set(
++            "error",
++            "DB 준비 중 오류가 발생했습니다. 백업 파일로 복구가 필요할 수 있습니다.",
++            error=str(e)[:500],
++            finished_at=time.time(),
++        )
+diff --git a/backend/app/models.py b/backend/app/models.py
+index f7043bc..ec01d76 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -1,8 +1,12 @@
+ import time
+-from sqlalchemy import Column, Integer, String, Float, Boolean, Text, ForeignKey
++from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, String, Text
+ from sqlalchemy.orm import relationship
+ from .database import Base
+ 
++# 참고: 기존 DB에 새로 추가되는 컬럼은 반드시 server_default 또는 nullable 로 정의한다.
++#       (migrations.py 가 기존 데이터를 새 테이블로 복사할 때 빈 값이 채워지도록)
++
++
+ class Agent(Base):
+     __tablename__ = "agents"
+ 
+@@ -11,49 +15,74 @@ class Agent(Base):
+     ip = Column(String(64), default="")
+     os_name = Column(String(128), default="")
+     os_build = Column(String(64), default="")
+-    mac_addr = Column(String, default="-")
+-    cpu_info = Column(String, default="-")
+-    ram_gb = Column(String, default="-")
+-    
++    mac_addr = Column(String, default="-", server_default="-")
++    cpu_info = Column(String, default="-", server_default="-")
++    ram_gb = Column(String, default="-", server_default="-")
++
+     # 에이전트 PC에서 생성한 고유 토큰의 해시값 및 콘솔 표시용 마스킹 문자열
+     token_hash = Column(String(128), nullable=False)
+     token_preview = Column(String(32), default="")
+-    
++
+     # pending(승인대기) | active(정상등록) | rejected(거부됨)
+     status = Column(String(20), default="pending", index=True)
+     ring = Column(String(32), default="ring1")
+-    
++
+     last_seen = Column(Float, default=time.time)
+     applied_hash = Column(String(32), default="")
+     reboot_required = Column(Boolean, default=False)
+     hotfix = Column(Text, default="")  # 설치 KB 목록 (길이 제한 없음)
+     agent_ver = Column(String(32), default="1.0")
+-    
++
+     pend_json = Column(Text, default="[]")
+-    hist_json = Column(Text, default="[]")
++    hist_json = Column(Text, default="[]")  # 설치/제거 이력, 최대 HISTORY_KEEP 건
+     upd_ts = Column(Float, nullable=True)
++    hist_ts = Column(Float, nullable=True)  # 이력이 마지막으로 갱신된 시각
+ 
+     commands = relationship("AgentCommand", back_populates="agent", cascade="all, delete-orphan")
++    reg_changes = relationship("RegistryChange", back_populates="agent", cascade="all, delete-orphan")
+ 
+ 
+ class AgentCommand(Base):
+-    """개별 PC 전용 명령 큐 (전체 방송이 아닌 특정 PC 핀포인트 제어 지원)"""
++    """개별 PC 전용 명령 큐 (온라인 PC에만 적재, COMMAND_TTL_SEC 경과 시 폐기)"""
+     __tablename__ = "agent_commands"
+ 
+     id = Column(Integer, primary_key=True, autoincrement=True)
+     machine_id = Column(String(64), ForeignKey("agents.machine_id", ondelete="CASCADE"), index=True)
+-    cmd_type = Column(String(32), nullable=False)  # scan, install_all, install_kb, hide_kb, unhide_kb, reboot, shutdown
+-    mac_addr = Column(String, default="")
+-    cpu_info = Column(String, default="")
+-    ram_gb = Column(String, default="")
++    # scan, install_all, install_kb, hide_kb, unhide_kb, reboot, shutdown, report_history, reg_rollback
++    cmd_type = Column(String(32), nullable=False)
+     payload_json = Column(Text, default="{}")
+-    status = Column(String(20), default="queued", index=True)  # queued | dispatched
+-    created_at = Column(Float, default=time.time)
+-
++    status = Column(String(20), default="queued", index=True)
++    created_at = Column(Float, default=time.time, index=True)
+ 
+     agent = relationship("Agent", back_populates="commands")
+ 
+ 
++class RegistryChange(Base):
++    """에이전트가 정책/롤백으로 변경한 레지스트리 값의 변경 전·후 기록 (롤백용)"""
++    __tablename__ = "registry_changes"
++
++    id = Column(Integer, primary_key=True, autoincrement=True)
++    machine_id = Column(String(64), ForeignKey("agents.machine_id", ondelete="CASCADE"), index=True)
++    cid = Column(String(64), unique=True, index=True)  # 에이전트가 발급한 변경 고유 ID (중복 보고 방지)
++    ts = Column(Float, default=time.time, index=True)
++    source = Column(String(16), default="policy")  # policy | rollback
++    policy_hash = Column(String(32), default="")
++    path = Column(String(512), nullable=False)
++    name = Column(String(256), nullable=False)
++    op = Column(String(16), default="set")  # set | delete
++    old_exists = Column(Boolean, default=False)
++    old_type = Column(Integer, nullable=True)  # winreg 타입 코드 (REG_SZ=1, REG_DWORD=4 ...)
++    old_value = Column(Text, default="null")  # JSON
++    new_exists = Column(Boolean, default=True)
++    new_type = Column(Integer, nullable=True)
++    new_value = Column(Text, default="null")  # JSON
++    rollback_state = Column(String(16), default="", server_default="")  # '' | requested | done | failed
++    rollback_ts = Column(Float, nullable=True)
++    rollback_msg = Column(String(256), default="", server_default="")
++
++    agent = relationship("Agent", back_populates="reg_changes")
++
++
+ class Policy(Base):
+     __tablename__ = "policies"
+ 
+@@ -79,6 +108,33 @@ class EventLog(Base):
+     host = Column(String(128), nullable=False)
+     msg = Column(Text, nullable=False)
+ 
++
++class AccessLog(Base):
++    """관리자 콘솔 접속 로그 (로그인 성공/실패, 로그아웃, 비밀번호 변경)"""
++    __tablename__ = "access_logs"
++
++    id = Column(Integer, primary_key=True, autoincrement=True)
++    ts = Column(Float, default=time.time, index=True)
++    username = Column(String(64), default="")
++    ip = Column(String(64), default="")
++    action = Column(String(32), nullable=False)  # login | login_fail | logout | password_change ...
++    ok = Column(Boolean, default=True)
++    detail = Column(String(256), default="")
++
++
++class Notification(Base):
++    """콘솔 알림 탭에 표시할 '확인 필요' 이벤트. 관리자가 확인하면 삭제된다."""
++    __tablename__ = "notifications"
++
++    id = Column(Integer, primary_key=True, autoincrement=True)
++    ts = Column(Float, default=time.time, index=True)
++    level = Column(String(8), default="info")  # info | warn | error
++    category = Column(String(32), default="")  # register | command | policy | rollback | agent | system | security
++    title = Column(String(128), nullable=False)
++    message = Column(Text, default="")
++    machine_id = Column(String(64), default="")
++
++
+ class UpdateCatalog(Base):
+     __tablename__ = "update_catalog"
+     kb = Column(String, primary_key=True, index=True)
+@@ -87,4 +143,4 @@ class UpdateCatalog(Base):
+     summary = Column(String, default="")
+     release_date = Column(String, default="")
+     source = Column(String, default="agent")  # 'microsoft' | 'agent'
+-    updated_at = Column(Float, default=0.0)
+\ No newline at end of file
++    updated_at = Column(Float, default=0.0)
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+index 15d2e56..b7a5410 100644
+--- a/backend/app/schemas.py
++++ b/backend/app/schemas.py
+@@ -44,4 +44,19 @@ class CheckinRequest(BaseModel):
+     agent_ver: str = "1.0"
+     results: List[Dict[str, Any]] = Field(default_factory=list)
+     updates: Optional[List[Dict[str, Any]]] = None
+-    history: Optional[List[Dict[str, Any]]] = None
+\ No newline at end of file
++    # 정기 보고: 설치/제거 이력 최근 30건
++    history: Optional[List[Dict[str, Any]]] = None
++    # 상세 모달에서 요청한 전체 이력 (설치/제거, 최대 100건) → 서버 보관분을 교체
++    history_full: Optional[List[Dict[str, Any]]] = None
++    # 에이전트가 수행한 레지스트리 변경 기록 (변경 전/후 값)
++    reg_changes: List[Dict[str, Any]] = Field(default_factory=list)
++
++
++class LoginRequest(BaseModel):
++    username: str
++    password: str
++
++
++class PasswordChangeRequest(BaseModel):
++    current_password: str
++    new_password: str
+\ No newline at end of file
+diff --git a/backend/app/security.py b/backend/app/security.py
+index cf7a7c9..fa67b39 100644
+--- a/backend/app/security.py
++++ b/backend/app/security.py
+@@ -1,53 +1,58 @@
+ import hashlib
+-import json
+-import os
+ import secrets
+-from fastapi import Header, HTTPException, Depends
++
++from fastapi import Depends, Header, HTTPException, Request
+ from sqlalchemy.orm import Session
+-from .database import BASE_DIR, get_db
+-from .models import Agent
+ 
+-TOKEN_FILE = os.path.join(BASE_DIR, "admin_token.json")
++from . import accounts
++from .database import get_db
++from .migrations import get_status
++from .models import Agent
++from .settings import is_admin_ip_allowed
+ 
+ 
+-def load_or_create_admin_token() -> str:
+-    os.makedirs(BASE_DIR, exist_ok=True)
+-    if os.path.exists(TOKEN_FILE):
+-        try:
+-            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+-                data = json.load(f)
+-                tok = data.get("admin_token") or data.get("token")
+-                if tok and isinstance(tok, str) and len(tok.strip()) >= 16:
+-                    return tok.strip()
+-        except Exception:
+-            pass
++def hash_token(raw_token: str) -> str:
++    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+ 
+-    new_token = secrets.token_urlsafe(32)
+-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+-        json.dump({"admin_token": new_token, "token": new_token}, f, indent=2)
+-    return new_token
+ 
+-ADMIN_TOKEN_FILE = os.path.join(BASE_DIR, "admin_token.json")
++def client_ip(request: Request) -> str:
++    return request.client.host if request.client else "unknown"
+ 
+-def load_or_create_admin_token() -> str:
+-    if os.path.exists(ADMIN_TOKEN_FILE):
+-        with open(ADMIN_TOKEN_FILE, "r", encoding="utf-8") as f:
+-            return json.load(f)["admin_token"]
+-    token = secrets.token_urlsafe(24)
+-    with open(ADMIN_TOKEN_FILE, "w", encoding="utf-8") as f:
+-        json.dump({"admin_token": token}, f, indent=2)
+-    return token
+ 
+-ADMIN_TOKEN = load_or_create_admin_token()
++def require_ready():
++    """DB 백업/마이그레이션이 끝나기 전에는 데이터 API를 막는다 (에이전트는 자동 재시도)"""
++    st = get_status()
++    if not st["ready"]:
++        raise HTTPException(status_code=503, detail=st["message"] or "서버 준비 중입니다.")
++    return True
+ 
+-def hash_token(raw_token: str) -> str:
+-    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+ 
+-def verify_admin(x_admin_token: str = Header(default="")):
+-    if not x_admin_token or not secrets.compare_digest(x_admin_token, ADMIN_TOKEN):
+-        raise HTTPException(status_code=401, detail="관리자 인증 토큰이 유효하지 않습니다.")
++def check_admin_ip(request: Request):
++    if not is_admin_ip_allowed(client_ip(request)):
++        raise HTTPException(status_code=403, detail="이 PC에서는 관리자 콘솔에 접근할 수 없습니다. (허용 IP 아님)")
+     return True
+ 
++
++def current_admin(
++    request: Request,
++    x_session_token: str = Header(default=""),
++    _ip_ok: bool = Depends(check_admin_ip),
++) -> dict:
++    """로그인 세션 확인 (계정 DB 기반). 비밀번호 변경이 필요한 계정도 통과시키되 플래그를 넘긴다."""
++    user = accounts.get_session_user(x_session_token)
++    if not user:
++        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
++    user["token"] = x_session_token
++    return user
++
++
++def verify_admin(user: dict = Depends(current_admin)) -> dict:
++    """일반 관리 API용: 최초 임시 비밀번호 상태에서는 비밀번호 변경 전까지 사용 불가"""
++    if user.get("must_change"):
++        raise HTTPException(status_code=403, detail="PASSWORD_CHANGE_REQUIRED")
++    return user
++
++
+ def verify_agent(
+     x_machine_id: str = Header(default=""),
+     x_agent_token: str = Header(default=""),
+@@ -55,7 +60,7 @@ def verify_agent(
+ ) -> Agent:
+     if not x_machine_id or not x_agent_token:
+         raise HTTPException(status_code=401, detail="에이전트 인증 헤더 누락")
+-    
++
+     agent = db.query(Agent).filter(Agent.machine_id == x_machine_id).first()
+     if not agent:
+         raise HTTPException(status_code=404, detail="미등록 에이전트")
+@@ -63,5 +68,5 @@ def verify_agent(
+         raise HTTPException(status_code=403, detail=f"에이전트 상태가 active가 아닙니다 ({agent.status})")
+     if not secrets.compare_digest(agent.token_hash, hash_token(x_agent_token)):
+         raise HTTPException(status_code=401, detail="에이전트 고유 토큰 불일치")
+-    
+-    return agent
+\ No newline at end of file
++
++    return agent
+diff --git a/backend/app/settings.py b/backend/app/settings.py
+new file mode 100644
+index 0000000..b3035a1
+--- /dev/null
++++ b/backend/app/settings.py
+@@ -0,0 +1,87 @@
++"""AURORA 관제 서버 설정 (단일 설정 지점)
++
++모든 서버 실행 설정은 데이터 폴더의 server_config.json 한 곳에서만 읽는다.
++  - 패키징(.exe) 실행: C:\\ProgramData\\AURORA\\Server\\server_config.json
++  - 개발 실행:         backend\\server_config.json
++
++{
++  "host": "0.0.0.0",             // 허용값: "0.0.0.0"(전체 네트워크) | "127.0.0.1"(서버 PC 내부 전용)
++  "port": 1557,
++  "admin_allowed_ips": []        // 관리자 콘솔 접근 허용 IP/대역(CIDR). 비어 있으면 제한 없음
++}
++"""
++import ipaddress
++import json
++import os
++
++from .database import BASE_DIR
++
++CONFIG_FILE = os.path.join(BASE_DIR, "server_config.json")
++
++DEFAULT_PORT = 1557
++ALLOWED_HOSTS = ("0.0.0.0", "127.0.0.1")
++DEFAULTS = {"host": "0.0.0.0", "port": DEFAULT_PORT, "admin_allowed_ips": []}
++
++# ---- 운영 상수 ----
++ONLINE_WINDOW_SEC = 60          # 마지막 체크인 후 이 시간 이내면 온라인으로 판단
++PENDING_ALIVE_SEC = 45          # 승인 대기 PC가 이 시간 이내에 등록 요청을 보냈으면 "응답 확인됨"
++COMMAND_TTL_SEC = 120           # 큐에 들어간 명령이 이 시간 안에 전달되지 않으면 폐기
++RETENTION_DAYS = 7              # 이벤트/명령/접속/알림 로그 보관 기간
++HISTORY_KEEP = 100              # PC별 서버 보관(=콘솔 표시) 업데이트 이력 최대 건수
++REGISTRY_CHANGE_KEEP = 200      # PC별 레지스트리 변경 이력 최대 보관 건수
++SESSION_HOURS = 12              # 콘솔 로그인 세션 유효 시간(마지막 사용 기준)
++
++
++def _validate(cfg: dict) -> dict:
++    out = dict(DEFAULTS)
++    host = str(cfg.get("host", DEFAULTS["host"])).strip()
++    out["host"] = host if host in ALLOWED_HOSTS else DEFAULTS["host"]
++    try:
++        port = int(cfg.get("port", DEFAULT_PORT))
++        out["port"] = port if 1 <= port <= 65535 else DEFAULT_PORT
++    except (TypeError, ValueError):
++        out["port"] = DEFAULT_PORT
++    nets = []
++    for raw in cfg.get("admin_allowed_ips") or []:
++        try:
++            nets.append(str(ipaddress.ip_network(str(raw).strip(), strict=False)))
++        except ValueError:
++            pass
++    out["admin_allowed_ips"] = nets
++    return out
++
++
++def load_server_config() -> dict:
++    """설정 파일을 읽고(없으면 기본값으로 생성) 검증된 값을 반환"""
++    cfg = {}
++    if os.path.exists(CONFIG_FILE):
++        try:
++            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
++                cfg = json.load(f)
++        except Exception:
++            cfg = {}
++    valid = _validate(cfg)
++    if valid != cfg:
++        try:
++            os.makedirs(BASE_DIR, exist_ok=True)
++            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
++                json.dump(valid, f, indent=2, ensure_ascii=False)
++        except OSError:
++            pass
++    return valid
++
++
++SERVER_CONFIG = load_server_config()
++
++
++def is_admin_ip_allowed(ip: str) -> bool:
++    nets = SERVER_CONFIG.get("admin_allowed_ips") or []
++    if not nets:
++        return True
++    try:
++        addr = ipaddress.ip_address(ip)
++    except ValueError:
++        return False
++    if addr.is_loopback:
++        return True  # 서버 PC 본인(콘솔 앱)은 항상 허용
++    return any(addr in ipaddress.ip_network(n) for n in nets)
+diff --git a/build/server_entry.py b/build/server_entry.py
+index 2e5bbb4..fd03927 100644
+--- a/build/server_entry.py
++++ b/build/server_entry.py
+@@ -1,5 +1,6 @@
+ import os
+ import sys
++
+ import uvicorn
+ 
+ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+@@ -7,8 +8,19 @@ BACKEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "backend"))
+ if BACKEND_DIR not in sys.path:
+     sys.path.insert(0, BACKEND_DIR)
+ 
++# 비상용 비밀번호 초기화 (서버 PC에서 관리자 권한 명령 프롬프트로 실행)
++#   AuroraServerEngine.exe --reset-password admin
++if len(sys.argv) >= 3 and sys.argv[1] == "--reset-password":
++    from app.accounts import reset_password  # noqa: E402
++
++    new_pw = reset_password(sys.argv[2])
++    print(f"[OK] '{sys.argv[2]}' 계정의 임시 비밀번호: {new_pw}")
++    print("     로그인 후 설정 탭에서 비밀번호를 변경해야 다른 메뉴를 사용할 수 있습니다.")
++    sys.exit(0)
++
+ from app.main import app  # noqa: E402
++from app.settings import SERVER_CONFIG  # noqa: E402
+ 
+ if __name__ == "__main__":
+-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+\ No newline at end of file
++    # 주소/포트는 server_config.json 한 곳에서만 지정 (host: 0.0.0.0 또는 127.0.0.1)
++    uvicorn.run(app, host=SERVER_CONFIG["host"], port=SERVER_CONFIG["port"], log_level="warning")
+diff --git a/electron-agent/build/installer.nsh b/electron-agent/build/installer.nsh
+index 6c1f1eb..18ab188 100644
+--- a/electron-agent/build/installer.nsh
++++ b/electron-agent/build/installer.nsh
+@@ -1,27 +1,32 @@
++!define AURORA_TASK_SCRIPT "$INSTDIR\resources\tasks\aurora-autostart.ps1"
++!define AURORA_TASK_NAME "AURORA Update Agent Tray"
++
+ !macro customInstall
+   DetailPrint "AURORA 백그라운드 업데이트 서비스를 등록하는 중..."
+   nsExec::ExecToLog '"$INSTDIR\resources\AuroraAgentEngine\AuroraAgentEngine.exe" install'
+   nsExec::ExecToLog '"$INSTDIR\resources\AuroraAgentEngine\AuroraAgentEngine.exe" start'
+ 
+-  DetailPrint "Windows 시작 시 트레이 에이전트 자동 실행 등록 중..."
++  DetailPrint "이전 버전의 자동 실행 레지스트리 정리 중..."
++  DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "AURORAUpdateAgent"
++
++  DetailPrint "작업 스케줄러에 트레이 자동 시작 등록 중 (로그온 시, 가장 높은 권한, --minimized)..."
+   ; 실행 인수는 main.js의 STARTUP_ARG(--minimized)와 반드시 동일하게 유지
+-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "AURORAUpdateAgent" '"$INSTDIR\AURORA Update Agent.exe" --minimized'
++  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${AURORA_TASK_SCRIPT}" -Action register -TaskName "${AURORA_TASK_NAME}" -Exe "$INSTDIR\AURORA Update Agent.exe" -Arguments "--minimized" -Scope AllUsers'
++
++  ; 에이전트 PC는 서버로 나가는 연결만 사용하므로 인바운드 방화벽 규칙이 필요 없음
++  ; (이전 버전 설치 파일이 추가한 규칙은 제거)
++  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AURORA Update Control Server"'
+ 
+   DetailPrint "AURORA Update Agent 트레이 실행 중..."
+   ; 설치 직후에는 서버 IP/포트를 입력할 수 있도록 설정 창을 띄운 상태로 실행 (인수 없음)
+   Exec '"$INSTDIR\AURORA Update Agent.exe"'
+-
+-  DetailPrint "Windows 방화벽에 AURORA 서버 포트(8080) 허용 규칙 추가 중..."
+-  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AURORA Update Control Server"'
+-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="AURORA Update Control Server" dir=in action=allow protocol=TCP localport=8080'
+-
+ !macroend
+ 
+ !macro customUnInstall
+-  DetailPrint "자동 실행 레지스트리 및 백그라운드 서비스 제거 중..."
++  DetailPrint "자동 시작 작업 및 백그라운드 서비스 제거 중..."
++  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${AURORA_TASK_SCRIPT}" -Action unregister -TaskName "${AURORA_TASK_NAME}"'
+   DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "AURORAUpdateAgent"
+   nsExec::ExecToLog 'taskkill /F /IM "AURORA Update Agent.exe" /T'
+   nsExec::ExecToLog '"$INSTDIR\resources\AuroraAgentEngine\AuroraAgentEngine.exe" stop'
+   nsExec::ExecToLog '"$INSTDIR\resources\AuroraAgentEngine\AuroraAgentEngine.exe" remove'
+-  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AURORA Update Control Server"'
+-!macroend
+\ No newline at end of file
++!macroend
+diff --git a/electron-agent/index.html b/electron-agent/index.html
+index 8ee38a7..3ec4fce 100644
+--- a/electron-agent/index.html
++++ b/electron-agent/index.html
+@@ -64,7 +64,7 @@
+       </div>
+       <div class="field port">
+         <label>포트</label>
+-        <input id="serverPort" type="number" placeholder="8080" />
++        <input id="serverPort" type="number" placeholder="1557" />
+       </div>
+     </div>
+     <button class="btn" onclick="saveSettings()">저장 및 서버 재연결</button>
+@@ -121,7 +121,7 @@
+       document.getElementById('serverIp').value = s.config.server_ip || '127.0.0.1';
+     }
+     if (document.activeElement !== document.getElementById('serverPort')) {
+-      document.getElementById('serverPort').value = s.config.server_port || 8080;
++      document.getElementById('serverPort').value = s.config.server_port || 1557;
+     }
+ 
+     document.getElementById('machineId').textContent = s.identity.machine_id || '서비스 시작 대기 중';
+diff --git a/electron-agent/main.js b/electron-agent/main.js
+index 4f88452..bd9336e 100644
+--- a/electron-agent/main.js
++++ b/electron-agent/main.js
+@@ -1,5 +1,5 @@
+ const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog } = require('electron');
+-const { exec } = require('child_process');
++const { exec, execFile } = require('child_process');
+ const fs = require('fs');
+ const path = require('path');
+ const http = require('http');
+@@ -7,9 +7,13 @@ const https = require('https');
+ 
+ const DATA_DIR = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA');
+ const IDENTITY_FILE = path.join(DATA_DIR, 'identity.json');
++// 관제 서버 주소의 단일 설정 지점 (서비스·워커·트레이 모두 이 파일만 사용)
+ const CONFIG_FILE = path.join(DATA_DIR, 'agent_config.json');
++const DEFAULT_SERVER_IP = '127.0.0.1';
++const DEFAULT_SERVER_PORT = 1557;
++const AUTOSTART_TASK = 'AURORA Update Agent Tray';
+ 
+-// 로그인 자동 실행 인수: --minimized (설치 파일 installer.nsh의 Run 레지스트리와 동일)
++// 로그인 자동 실행 인수: --minimized (작업 스케줄러 자동 시작 작업과 동일)
+ // --tray / --hidden 은 이전 버전 설치본 호환용으로만 인식
+ const STARTUP_ARG = '--minimized';
+ const START_MINIMIZED = [STARTUP_ARG, '--tray', '--hidden'].some((a) => process.argv.includes(a));
+@@ -37,17 +41,74 @@ function readJsonSafe(filePath, fallback) {
+   return fallback;
+ }
+ 
+-// 사용자가 'http://192.168.0.10:8080' 형태로 입력해도 순수 호스트명만 추출
++// 사용자가 'http://192.168.0.10:1557' 형태로 입력해도 순수 호스트명만 추출
+ function normalizeHost(rawIp) {
+   return (
+     String(rawIp || '')
+       .trim()
+       .replace(/^https?:\/\//i, '')
+       .replace(/\/.*$/, '')
+-      .replace(/:\d+$/, '') || '127.0.0.1'
++      .replace(/:\d+$/, '') || DEFAULT_SERVER_IP
+   );
+ }
+ 
++function readServerConfig() {
++  const cfg = readJsonSafe(CONFIG_FILE, {});
++  let ip = cfg.server_ip;
++  let port = cfg.server_port;
++  if (!ip && cfg.server_url) {
++    // 이전 버전 설정 파일 호환
++    const m = String(cfg.server_url).match(/^(?:https?:\/\/)?([^/:]+)(?::(\d+))?/i);
++    if (m) {
++      ip = m[1];
++      port = m[2];
++    }
++  }
++  return {
++    server_ip: normalizeHost(ip || DEFAULT_SERVER_IP),
++    server_port: parseInt(port, 10) || DEFAULT_SERVER_PORT,
++  };
++}
++
++function writeServerConfig(ip, port) {
++  ensureDataDir();
++  const payload = {
++    server_ip: normalizeHost(ip),
++    server_port: parseInt(port, 10) || DEFAULT_SERVER_PORT,
++  };
++  fs.writeFileSync(CONFIG_FILE, JSON.stringify(payload, null, 2), 'utf8');
++  return payload;
++}
++
++function getAutostartScriptPath() {
++  return app.isPackaged
++    ? path.join(process.resourcesPath, 'tasks', 'aurora-autostart.ps1')
++    : path.join(__dirname, 'resources', 'tasks', 'aurora-autostart.ps1');
++}
++
++// 작업 스케줄러 자동 시작 작업 등록/해제/조회 (관리자 권한 앱은 Run 레지스트리로 자동 실행되지 않음)
++function runAutostartTask(action) {
++  return new Promise((resolve) => {
++    execFile(
++      'powershell.exe',
++      [
++        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
++        '-File', getAutostartScriptPath(),
++        '-Action', action,
++        '-TaskName', AUTOSTART_TASK,
++        '-Exe', process.execPath,
++        '-Arguments', STARTUP_ARG,
++        '-Scope', 'AllUsers',
++      ],
++      { windowsHide: true },
++      (err, stdout) => {
++        const out = String(stdout || '').trim();
++        resolve({ ok: !err && !out.startsWith('ERROR'), registered: out.includes('REGISTERED') && !out.includes('NOT_'), message: out });
++      }
++    );
++  });
++}
++
+ function getEngineExePath() {
+   return app.isPackaged
+     ? path.join(process.resourcesPath, 'AuroraAgentEngine', 'AuroraAgentEngine.exe')
+@@ -68,12 +129,12 @@ function checkServiceStatus() {
+ function pingServer(ip, port) {
+   return new Promise((resolve) => {
+     const cleanHost = normalizeHost(ip);
+-    const cleanPort = parseInt(port, 10) || 8080;
++    const cleanPort = parseInt(port, 10) || DEFAULT_SERVER_PORT;
+     const req = http.get(
+-      { hostname: cleanHost, port: cleanPort, path: '/api/state', timeout: 2000 },
++      { hostname: cleanHost, port: cleanPort, path: '/api/health', timeout: 2000 },
+       (res) => {
+         res.resume();
+-        resolve(res.statusCode === 200 || res.statusCode === 401 || res.statusCode === 403);
++        resolve(res.statusCode === 200);
+       }
+     );
+     req.on('error', () => resolve(false));
+@@ -88,25 +149,25 @@ function pingServer(ip, port) {
+ function ensureBootPersistenceAndReconnect() {
+   ensureDataDir();
+ 
+-  // 1. 마지막 연결 서버 설정(agent_config.json) 보존 (없을 때만 기본값 생성)
+-  if (!fs.existsSync(CONFIG_FILE)) {
+-    const defaultCfg = {
+-      server_ip: '127.0.0.1',
+-      server_port: 8080,
+-      server_url: 'http://127.0.0.1:8080',
+-    };
+-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaultCfg, null, 2), 'utf8');
+-  }
++  // 1. 마지막 연결 서버 설정(agent_config.json) 보존 (없으면 기본값, 이전 형식이면 새 형식으로 정리)
++  const cfg = readServerConfig();
++  writeServerConfig(cfg.server_ip, cfg.server_port);
+ 
+-  // 2. 로그인 자동 실행은 설치 파일이 HKLM Run(모든 사용자, --minimized)으로 등록한다.
+-  //    이전 버전이 사용자별(HKCU)로 중복 등록한 항목은 정리하여 트레이가 두 번 뜨지 않도록 한다.
++  // 2. 로그인 자동 실행: 작업 스케줄러(가장 높은 권한, 모든 사용자 로그온, --minimized)
++  //    설치 파일이 등록하지만, 누락된 경우를 대비해 실행 시마다 확인 후 재등록한다.
++  //    이전 버전이 등록한 HKCU 로그인 항목은 중복 실행 방지를 위해 정리한다.
+   if (app.isPackaged) {
+     try {
+-      const legacy = { path: process.execPath, args: [STARTUP_ARG] };
+-      if (app.getLoginItemSettings(legacy).openAtLogin) {
+-        app.setLoginItemSettings({ ...legacy, openAtLogin: false });
++      for (const args of [[STARTUP_ARG], ['--tray']]) {
++        const legacy = { path: process.execPath, args };
++        if (app.getLoginItemSettings(legacy).openAtLogin) {
++          app.setLoginItemSettings({ ...legacy, openAtLogin: false });
++        }
+       }
+     } catch (e) {}
++    runAutostartTask('query').then((r) => {
++      if (!r.registered) runAutostartTask('register');
++    });
+   }
+ 
+   // 3. Windows 부팅 시 백그라운드 서비스 자동 시작 및 실패 시 자동 재시작 설정 + 즉시 기동
+@@ -167,13 +228,11 @@ function restartAgentService() {
+ function sendShutdownLogToServer() {
+   return new Promise((resolve) => {
+     const identity = readJsonSafe(IDENTITY_FILE, {});
+-    const config = readJsonSafe(CONFIG_FILE, { server_ip: '127.0.0.1', server_port: 8080 });
++    const config = readServerConfig();
+ 
+     if (!identity.machine_id || !identity.agent_token) return resolve();
+ 
+-    const baseUrl =
+-      config.server_url ||
+-      `http://${normalizeHost(config.server_ip)}:${config.server_port || 8080}`;
++    const baseUrl = `http://${config.server_ip}:${config.server_port}`;
+     const targetUrl = new URL('/api/agent/shutdown', baseUrl);
+     const body = JSON.stringify({
+       machine_id: identity.machine_id,
+@@ -235,25 +294,14 @@ function showStatusWindow() {
+ 
+ ipcMain.handle('get-state', async () => {
+   const identity = readJsonSafe(IDENTITY_FILE, { machine_id: '', agent_token: '' });
+-  const config = readJsonSafe(CONFIG_FILE, { server_ip: '127.0.0.1', server_port: 8080 });
++  const config = readServerConfig();
+   const serviceStatus = await checkServiceStatus();
+-  const serverReachable = await pingServer(
+-    config.server_ip || '127.0.0.1',
+-    config.server_port || 8080
+-  );
++  const serverReachable = await pingServer(config.server_ip, config.server_port);
+   return { identity, config, serviceStatus, serverReachable };
+ });
+ 
+ ipcMain.handle('save-config', async (_event, { ip, port }) => {
+-  ensureDataDir();
+-  const cleanIp = normalizeHost(ip);
+-  const cleanPort = parseInt(port, 10) || 8080;
+-  const payload = {
+-    server_ip: cleanIp,
+-    server_port: cleanPort,
+-    server_url: `http://${cleanIp}:${cleanPort}`,
+-  };
+-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(payload, null, 2), 'utf8');
++  writeServerConfig(ip, port);
+   return await restartAgentService();
+ });
+ 
+diff --git a/electron-agent/resources/tasks/aurora-autostart.ps1 b/electron-agent/resources/tasks/aurora-autostart.ps1
+new file mode 100644
+index 0000000..1990faa
+--- /dev/null
++++ b/electron-agent/resources/tasks/aurora-autostart.ps1
+@@ -0,0 +1,60 @@
++﻿<#
++  AURORA 자동 시작 작업(작업 스케줄러) 등록/해제/조회 스크립트
++  - 관리자 권한(requireAdministrator) 앱은 Run 레지스트리로는 로그인 시 실행되지 않으므로
++    "가장 높은 수준의 권한으로 실행" 로그온 작업으로 등록한다.
++  - Scope AllUsers  : 모든 사용자 로그온 시 실행 (에이전트 트레이)
++    Scope CurrentUser: 현재 사용자 로그온 시에만 실행 (관제 콘솔)
++
++  사용 예)
++    powershell -NoProfile -ExecutionPolicy Bypass -File aurora-autostart.ps1 -Action register `
++      -TaskName "AURORA Update Agent Tray" -Exe "C:\Program Files\AURORA Update Agent\AURORA Update Agent.exe" `
++      -Arguments "--minimized" -Scope AllUsers
++#>
++param(
++  [ValidateSet('register', 'unregister', 'query')][string]$Action = 'query',
++  [Parameter(Mandatory = $true)][string]$TaskName,
++  [string]$Exe = '',
++  [string]$Arguments = '--minimized',
++  [ValidateSet('AllUsers', 'CurrentUser')][string]$Scope = 'AllUsers'
++)
++$ErrorActionPreference = 'Stop'
++$TaskPath = '\AURORA\'
++
++function Get-AuroraTask {
++  Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
++}
++
++try {
++  switch ($Action) {
++    'query' {
++      if (Get-AuroraTask) { Write-Output 'REGISTERED' } else { Write-Output 'NOT_REGISTERED' }
++    }
++    'unregister' {
++      if (Get-AuroraTask) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Confirm:$false }
++      Write-Output 'NOT_REGISTERED'
++    }
++    'register' {
++      if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { throw "실행 파일을 찾을 수 없습니다: $Exe" }
++      $act = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments -WorkingDirectory (Split-Path -Parent $Exe)
++      if ($Scope -eq 'AllUsers') {
++        $trg = New-ScheduledTaskTrigger -AtLogOn
++        # BUILTIN\Users 그룹: 로그온한 각 사용자 세션에서 실행 (관리자 계정은 권한 상승 상태로 실행)
++        $prn = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Highest
++      } else {
++        $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
++        $trg = New-ScheduledTaskTrigger -AtLogOn -User $user
++        $prn = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
++      }
++      $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
++        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
++      $task = New-ScheduledTask -Action $act -Trigger $trg -Principal $prn -Settings $set `
++        -Description 'AURORA 자동 시작 (로그온 시 트레이로 실행)'
++      Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -InputObject $task -Force | Out-Null
++      Write-Output 'REGISTERED'
++    }
++  }
++  exit 0
++} catch {
++  Write-Output "ERROR: $($_.Exception.Message)"
++  exit 1
++}
+diff --git a/electron-console/build/installer.nsh b/electron-console/build/installer.nsh
+new file mode 100644
+index 0000000..85ff420
+--- /dev/null
++++ b/electron-console/build/installer.nsh
+@@ -0,0 +1,17 @@
++!define AURORA_TASK_SCRIPT "$INSTDIR\resources\tasks\aurora-autostart.ps1"
++!define AURORA_TASK_NAME "AURORA Control Console"
++!define AURORA_PORT "1557"
++
++!macro customInstall
++  ; 관제 서버 포트(기본 1557) 인바운드 허용. 포트를 바꾸면 server_config.json과 이 규칙을 함께 수정
++  DetailPrint "Windows 방화벽에 AURORA 관제 서버 포트(${AURORA_PORT}) 허용 규칙 추가 중..."
++  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AURORA Control Server"'
++  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="AURORA Control Server" dir=in action=allow protocol=TCP localport=${AURORA_PORT}'
++!macroend
++
++!macro customUnInstall
++  DetailPrint "방화벽 규칙 및 자동 시작 작업 제거 중..."
++  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="AURORA Control Server"'
++  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${AURORA_TASK_SCRIPT}" -Action unregister -TaskName "${AURORA_TASK_NAME}"'
++  nsExec::ExecToLog 'taskkill /F /IM AuroraServerEngine.exe /T'
++!macroend
+diff --git a/electron-console/main.js b/electron-console/main.js
+index 09e6d48..ccbe3e1 100644
+--- a/electron-console/main.js
++++ b/electron-console/main.js
+@@ -1,5 +1,5 @@
+ const { app, BrowserWindow, Tray, Menu, nativeImage, dialog, ipcMain } = require('electron');
+-const { spawn, exec } = require('child_process');
++const { spawn, exec, execFile } = require('child_process');
+ const path = require('path');
+ const http = require('http');
+ const fs = require('fs');
+@@ -8,7 +8,22 @@ let serverProcess = null;
+ let mainWindow = null;
+ let tray = null;
+ let isQuitting = false;
+-const PORT = 8080;
++// 관제 서버 설정의 단일 지점: 서버 엔진과 같은 server_config.json 을 읽는다
++const SERVER_DATA_DIR = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA', 'Server');
++const SERVER_CONFIG_FILE = path.join(SERVER_DATA_DIR, 'server_config.json');
++const DEFAULT_PORT = 1557;
++const AUTOSTART_TASK = 'AURORA Control Console';
++const STARTUP_ARG = '--minimized';
++
++function readServerPort() {
++  try {
++    const cfg = JSON.parse(fs.readFileSync(SERVER_CONFIG_FILE, 'utf8'));
++    const p = parseInt(cfg.port, 10);
++    if (p >= 1 && p <= 65535) return p;
++  } catch (e) {}
++  return DEFAULT_PORT;
++}
++const PORT = readServerPort();
+ // 로그인 자동 시작(--minimized) 시에는 창을 띄우지 않고 트레이로 시작
+ const START_MINIMIZED = process.argv.includes('--minimized') || process.argv.includes('--hidden');
+ 
+@@ -21,7 +36,8 @@ function startBackendServer() {
+     ? path.join(process.resourcesPath, 'AuroraServerEngine', 'AuroraServerEngine.exe')
+     : path.join(__dirname, 'resources', 'AuroraServerEngine', 'AuroraServerEngine.exe');
+ 
+-  serverProcess = spawn(serverExe, [String(PORT)], {
++  // 포트/주소는 서버 엔진이 server_config.json 에서 직접 읽는다 (인수로 넘기지 않음)
++  serverProcess = spawn(serverExe, [], {
+     cwd: path.dirname(serverExe),
+     windowsHide: true,
+   });
+@@ -29,7 +45,7 @@ function startBackendServer() {
+   serverProcess.on('error', (err) => {
+     if (err.code === 'EACCES') {
+       exec(
+-        `powershell -NoProfile -Command "Start-Process -FilePath '${serverExe}' -ArgumentList '${PORT}' -WorkingDirectory '${path.dirname(serverExe)}' -Verb RunAs -WindowStyle Hidden"`
++        `powershell -NoProfile -Command "Start-Process -FilePath '${serverExe}' -WorkingDirectory '${path.dirname(serverExe)}' -Verb RunAs -WindowStyle Hidden"`
+       );
+       return;
+     }
+@@ -51,14 +67,37 @@ function waitForServer(url, retries = 35) {
+   });
+ }
+ 
+-function readLocalAdminToken() {
+-  const tokenPath = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA', 'Server', 'admin_token.json');
+-  try {
+-    if (fs.existsSync(tokenPath)) {
+-      return JSON.parse(fs.readFileSync(tokenPath, 'utf8')).admin_token || '';
+-    }
+-  } catch (e) {}
+-  return '';
++function getAutostartScriptPath() {
++  return app.isPackaged
++    ? path.join(process.resourcesPath, 'tasks', 'aurora-autostart.ps1')
++    : path.join(__dirname, 'resources', 'tasks', 'aurora-autostart.ps1');
++}
++
++// 콘솔 자동 시작: 관리자 권한 앱이므로 작업 스케줄러(현재 사용자 로그온, 가장 높은 권한)로 등록
++function runAutostartTask(action) {
++  return new Promise((resolve) => {
++    execFile(
++      'powershell.exe',
++      [
++        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
++        '-File', getAutostartScriptPath(),
++        '-Action', action,
++        '-TaskName', AUTOSTART_TASK,
++        '-Exe', process.execPath,
++        '-Arguments', STARTUP_ARG,
++        '-Scope', 'CurrentUser',
++      ],
++      { windowsHide: true },
++      (err, stdout) => {
++        const out = String(stdout || '').trim();
++        resolve({
++          ok: !err && !out.startsWith('ERROR'),
++          registered: out.includes('REGISTERED') && !out.includes('NOT_'),
++          message: out,
++        });
++      }
++    );
++  });
+ }
+ 
+ function createTray() {
+@@ -139,18 +178,9 @@ async function createWindow() {
+   });
+ 
+   try {
+-    await waitForServer(`http://127.0.0.1:${PORT}/docs`);
++    await waitForServer(`http://127.0.0.1:${PORT}/api/health`);
++    // 로그인은 아이디/비밀번호로 진행 (관리자 토큰 자동 주입 제거)
+     await mainWindow.loadURL(`http://127.0.0.1:${PORT}`);
+-
+-    const localToken = readLocalAdminToken();
+-    if (localToken) {
+-      await mainWindow.webContents.executeJavaScript(`
+-        if (!sessionStorage.getItem('aurora_admin_token')) {
+-          sessionStorage.setItem('aurora_admin_token', ${JSON.stringify(localToken)});
+-          location.reload();
+-        }
+-      `);
+-    }
+   } catch (e) {
+     dialog.showErrorBox('연결 실패', e.message);
+   }
+@@ -168,24 +198,33 @@ if (!gotLock) {
+   });
+ 
+   // 콘솔 자동 시작 설정 (preload.js의 consoleApi를 통해 웹 UI에서 호출)
+-  // 로그인 자동 시작 시에는 창 없이 트레이로 시작하도록 --minimized 인수를 함께 등록
+-  const LOGIN_ITEM = { path: process.execPath, args: ['--minimized'] };
+-
+-  ipcMain.handle('get-console-prefs', () => {
+-    const settings = app.getLoginItemSettings(LOGIN_ITEM);
+-    return { openAtLogin: Boolean(settings.openAtLogin) };
++  ipcMain.handle('get-console-prefs', async () => {
++    if (!app.isPackaged) return { openAtLogin: false };
++    const r = await runAutostartTask('query');
++    return { openAtLogin: r.registered };
+   });
+ 
+-  ipcMain.handle('set-console-autostart', (_e, enable) => {
++  ipcMain.handle('set-console-autostart', async (_e, enable) => {
+     if (!app.isPackaged) {
+-      // 개발 모드(electron .)에서는 electron.exe가 등록되므로 실제 반영하지 않음
+       return { ok: false, openAtLogin: false, message: '개발 모드에서는 자동 시작을 설정할 수 없습니다.' };
+     }
+-    app.setLoginItemSettings({ ...LOGIN_ITEM, openAtLogin: Boolean(enable) });
+-    const applied = Boolean(app.getLoginItemSettings(LOGIN_ITEM).openAtLogin);
+-    return { ok: applied === Boolean(enable), openAtLogin: applied };
++    const r = await runAutostartTask(enable ? 'register' : 'unregister');
++    const q = await runAutostartTask('query');
++    return { ok: r.ok && q.registered === Boolean(enable), openAtLogin: q.registered, message: r.message };
+   });
+ 
++  // 이전 버전이 등록한 로그인 항목(HKCU Run)은 관리자 권한 앱이라 동작하지 않으므로 정리
++  if (app.isPackaged) {
++    try {
++      for (const args of [[], [STARTUP_ARG]]) {
++        const legacy = { path: process.execPath, args };
++        if (app.getLoginItemSettings(legacy).openAtLogin) {
++          app.setLoginItemSettings({ ...legacy, openAtLogin: false });
++        }
++      }
++    } catch (e) {}
++  }
++
+   app.whenReady().then(() => {
+     createTray();
+     createWindow();
+diff --git a/electron-console/package.json b/electron-console/package.json
+index 5cc1cac..9645e22 100644
+--- a/electron-console/package.json
++++ b/electron-console/package.json
+@@ -31,7 +31,8 @@
+       "perMachine": true,
+       "allowToChangeInstallationDirectory": true,
+       "createDesktopShortcut": true,
+-      "createStartMenuShortcut": true
++      "createStartMenuShortcut": true,
++      "include": "build/installer.nsh"
+     }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/electron-console/resources/tasks/aurora-autostart.ps1 b/electron-console/resources/tasks/aurora-autostart.ps1
+new file mode 100644
+index 0000000..1990faa
+--- /dev/null
++++ b/electron-console/resources/tasks/aurora-autostart.ps1
+@@ -0,0 +1,60 @@
++﻿<#
++  AURORA 자동 시작 작업(작업 스케줄러) 등록/해제/조회 스크립트
++  - 관리자 권한(requireAdministrator) 앱은 Run 레지스트리로는 로그인 시 실행되지 않으므로
++    "가장 높은 수준의 권한으로 실행" 로그온 작업으로 등록한다.
++  - Scope AllUsers  : 모든 사용자 로그온 시 실행 (에이전트 트레이)
++    Scope CurrentUser: 현재 사용자 로그온 시에만 실행 (관제 콘솔)
++
++  사용 예)
++    powershell -NoProfile -ExecutionPolicy Bypass -File aurora-autostart.ps1 -Action register `
++      -TaskName "AURORA Update Agent Tray" -Exe "C:\Program Files\AURORA Update Agent\AURORA Update Agent.exe" `
++      -Arguments "--minimized" -Scope AllUsers
++#>
++param(
++  [ValidateSet('register', 'unregister', 'query')][string]$Action = 'query',
++  [Parameter(Mandatory = $true)][string]$TaskName,
++  [string]$Exe = '',
++  [string]$Arguments = '--minimized',
++  [ValidateSet('AllUsers', 'CurrentUser')][string]$Scope = 'AllUsers'
++)
++$ErrorActionPreference = 'Stop'
++$TaskPath = '\AURORA\'
++
++function Get-AuroraTask {
++  Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
++}
++
++try {
++  switch ($Action) {
++    'query' {
++      if (Get-AuroraTask) { Write-Output 'REGISTERED' } else { Write-Output 'NOT_REGISTERED' }
++    }
++    'unregister' {
++      if (Get-AuroraTask) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Confirm:$false }
++      Write-Output 'NOT_REGISTERED'
++    }
++    'register' {
++      if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { throw "실행 파일을 찾을 수 없습니다: $Exe" }
++      $act = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments -WorkingDirectory (Split-Path -Parent $Exe)
++      if ($Scope -eq 'AllUsers') {
++        $trg = New-ScheduledTaskTrigger -AtLogOn
++        # BUILTIN\Users 그룹: 로그온한 각 사용자 세션에서 실행 (관리자 계정은 권한 상승 상태로 실행)
++        $prn = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Highest
++      } else {
++        $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
++        $trg = New-ScheduledTaskTrigger -AtLogOn -User $user
++        $prn = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
++      }
++      $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
++        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
++      $task = New-ScheduledTask -Action $act -Trigger $trg -Principal $prn -Settings $set `
++        -Description 'AURORA 자동 시작 (로그온 시 트레이로 실행)'
++      Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -InputObject $task -Force | Out-Null
++      Write-Output 'REGISTERED'
++    }
++  }
++  exit 0
++} catch {
++  Write-Output "ERROR: $($_.Exception.Message)"
++  exit 1
++}
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index a9a682f..babe6ae 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -11,8 +11,7 @@ import {
+   XCircle,
+   ShieldCheck,
+   KeyRound,
+-  Copy,
+-  Check,
++  Bell,
+   RefreshCw,
+   Download,
+   RotateCcw,
+@@ -30,13 +29,21 @@ import {
+   Power,
+ } from 'lucide-react';
+ import { DashboardState, Agent } from './types';
+-import { apiFetch, getAdminToken, setAdminToken } from './api';
++import { apiFetch, clearSession, errorMessage, getSessionToken, getSessionUser } from './api';
+ import { AgentDrawer } from './components/AgentDrawer';
++import { LoginScreen } from './components/LoginScreen';
++import { StartupLoading } from './components/StartupLoading';
++import { NotificationsPanel } from './components/NotificationsPanel';
++import { RejectedPcs } from './components/RejectedPcs';
++import { AccessLogPanel } from './components/AccessLogPanel';
++import { PasswordChangeForm } from './components/PasswordChangeForm';
+ 
+ type MenuKey =
+   | 'dashboard'
+   | 'pcs-managed'
+   | 'pcs-pending'
++  | 'pcs-rejected'
++  | 'notifications'
+   | 'policy-registry'
+   | 'policy-rules'
+   | 'logs'
+@@ -147,9 +154,10 @@ function formatLastSeen(ts: number): string {
+ }
+ 
+ export default function App() {
+-  const [token, setTokenState] = useState(getAdminToken());
+-  const [tokenInput, setTokenInput] = useState('');
+-  const [copied, setCopied] = useState(false);
++  // 로그인 → 로딩(DB 백업/마이그레이션 진행 표시) → 준비 완료
++  const [phase, setPhase] = useState<'login' | 'loading' | 'ready'>(() => (getSessionToken() ? 'loading' : 'login'));
++  const [username, setUsername] = useState(getSessionUser());
++  const [forcePwChange, setForcePwChange] = useState(false);
+   const [state, setState] = useState<DashboardState | null>(null);
+ 
+   // 테마 상태
+@@ -201,8 +209,25 @@ const showToast = (msg: string) => {
+     localStorage.setItem('aurora_theme', theme);
+   }, [theme]);
+ 
++  const goLogin = useCallback(() => {
++    clearSession();
++    setState(null);
++    setActiveAgent(null);
++    setForcePwChange(false);
++    setPhase('login');
++  }, []);
++
++  const logout = async () => {
++    try {
++      await apiFetch('/auth/logout', {});
++    } catch {
++      /* 세션이 이미 만료된 경우 무시 */
++    }
++    goLogin();
++  };
++
+   const fetchState = useCallback(async () => {
+-    if (!getAdminToken()) return;
++    if (!getSessionToken()) return;
+     try {
+       const data = await apiFetch<DashboardState>('/state');
+       setState(data);
+@@ -211,16 +236,23 @@ const showToast = (msg: string) => {
+         prev ? data.agents.find((a) => a.machine_id === prev.machine_id) || null : null
+       );
+     } catch (e: any) {
+-      if (e.message === 'UNAUTHORIZED') setTokenState('');
++      if (e.message === 'UNAUTHORIZED') goLogin();
++      else if (e.message === 'PASSWORD_CHANGE_REQUIRED') {
++        setForcePwChange(true);
++        setPhase('login');
++      } else if (e.message === 'NOT_READY') setPhase('loading');
+     }
+-  }, []);
++  }, [goLogin]);
+ 
+   useEffect(() => {
++    if (phase !== 'ready') return;
+     fetchState();
+     const intervalMs = activeMenu === 'dashboard' ? 30000 : 10000;
+     const id = setInterval(fetchState, intervalMs);
+     return () => clearInterval(id);
+-  }, [fetchState, token, activeMenu]);
++  }, [fetchState, phase, activeMenu]);
++
++  const onStartupReady = useCallback(() => setPhase('ready'), []);
+ 
+   useEffect(() => {
+     if (state && state.policies[ringTab] && loadedRing !== ringTab) {
+@@ -230,7 +262,7 @@ const showToast = (msg: string) => {
+   }, [state, ringTab, loadedRing]);
+ 
+   const navigateToMenu = (menu: MenuKey) => {
+-    if (menu === 'pcs-managed' || menu === 'pcs-pending') {
++    if (menu === 'pcs-managed' || menu === 'pcs-pending' || menu === 'pcs-rejected') {
+       setPcMenuOpen(true);
+     }
+     if (menu === 'policy-registry' || menu === 'policy-rules') {
+@@ -274,12 +306,6 @@ const showToast = (msg: string) => {
+     }
+   };
+ 
+-  const copyToken = () => {
+-    navigator.clipboard.writeText(token);
+-    setCopied(true);
+-    setTimeout(() => setCopied(false), 2000);
+-  };
+-
+   // Electron 콘솔(preload의 consoleApi)에서 실제 Windows 로그인 항목 상태를 읽어와 동기화
+   useEffect(() => {
+     const ipc = (window as any).consoleApi;
+@@ -312,58 +338,37 @@ const showToast = (msg: string) => {
+     }
+   };
+ 
+-  if (!token) {
++  if (phase === 'login') {
+     return (
+-      <div className="login-wrap">
+-        <div className="glass-card login-card">
+-          <div className="brand-group" style={{ marginBottom: 22 }}>
+-            <div className="brand-logo mono">AU</div>
+-            <div>
+-              <h1 className="brand-title">AURORA Update Control</h1>
+-              <p className="brand-sub">엔터프라이즈 패치 및 에이전트 중앙 관제</p>
+-            </div>
+-          </div>
+-          <form
+-            onSubmit={(e) => {
+-              e.preventDefault();
+-              setAdminToken(tokenInput);
+-              setTokenState(tokenInput);
+-            }}
+-            style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
+-          >
+-            <div>
+-              <label style={{ display: 'block', fontSize: 12, marginBottom: 6 }}>
+-                관리자 인증 토큰
+-              </label>
+-              <input
+-                type="password"
+-                value={tokenInput}
+-                onChange={(e) => setTokenInput(e.target.value)}
+-                placeholder="C:\ProgramData\AURORA\Server\admin_token.json"
+-                className="input-dark mono"
+-                style={{ width: '100%' }}
+-                autoFocus
+-              />
+-            </div>
+-            <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '10px' }}>
+-              콘솔 접속하기
+-            </button>
+-          </form>
+-        </div>
+-      </div>
++      <LoginScreen
++        forcePasswordChange={forcePwChange}
++        usernameHint={username || undefined}
++        onLoggedIn={(u) => {
++          setUsername(u);
++          setForcePwChange(false);
++          setPhase('loading');
++        }}
++      />
+     );
+   }
+ 
++  if (phase === 'loading') {
++    return <StartupLoading onReady={onStartupReady} onUnauthorized={goLogin} />;
++  }
++
+   if (!state) {
+     return (
+       <div className="login-wrap mono" style={{ color: 'var(--accent-text)', fontSize: 14 }}>
+-        서버 상태 동기화 중...
++        PC 목록을 불러오는 중입니다...
+       </div>
+     );
+   }
+ 
+   const agents = state.agents;
+   const pending = state.pending_agents || [];
++  const rejected = state.rejected_agents || [];
++  const notifCount = state.notification_count || 0;
++  const pendingAliveSec = state.limits?.pending_alive_sec ?? 45;
+   const isOnline = (a: Agent) => state.now - a.last_seen < 60;
+   const isApplied = (a: Agent) => a.applied_hash && a.applied_hash === a.target_hash;
+   const compliancePct = agents.length
+@@ -451,7 +456,12 @@ const showToast = (msg: string) => {
+   };
+ 
+   const handleDecision = async (machineId: string, approve: boolean, ring = 'ring1') => {
+-    await apiFetch(`/agents/${machineId}/decision`, { approve, ring });
++    try {
++      await apiFetch(`/agents/${encodeURIComponent(machineId)}/decision`, { approve, ring });
++      showToast(approve ? '✓ 에이전트 응답을 확인하고 승인했습니다. 다음 통신부터 관리 대상으로 등록됩니다.' : '등록을 거부했습니다. (거부 PC 메뉴에서 해제 가능)');
++    } catch (e) {
++      alert(errorMessage(e));
++    }
+     fetchState();
+   };
+ 
+@@ -485,8 +495,18 @@ const showToast = (msg: string) => {
+     return;
+   }
+ 
+-  await apiFetch('/commands', { machine_ids: Array.from(selectedIds), type });
+-  showToast(`✓ ${selectedIds.size}대 PC에 [${label}] 명령을 전송했습니다.`);
++  try {
++    const res = await apiFetch<{ dispatched: number; skipped: string[] }>('/commands', {
++      machine_ids: Array.from(selectedIds),
++      type,
++    });
++    const skippedMsg = res.skipped?.length
++      ? ` (오프라인 ${res.skipped.length}대 제외: ${res.skipped.slice(0, 3).join(', ')}${res.skipped.length > 3 ? ' 외' : ''})`
++      : '';
++    showToast(`✓ ${res.dispatched}대 PC에 [${label}] 명령을 전송했습니다.${skippedMsg}`);
++  } catch (e) {
++    alert(errorMessage(e));
++  }
+   fetchState();
+ };
+ 
+@@ -504,7 +524,7 @@ const showToast = (msg: string) => {
+     return ev.host.toLowerCase().includes(q) || ev.msg.toLowerCase().includes(q);
+   });
+ 
+-  const isPcMenuActive = activeMenu === 'pcs-managed' || activeMenu === 'pcs-pending';
++  const isPcMenuActive = activeMenu === 'pcs-managed' || activeMenu === 'pcs-pending' || activeMenu === 'pcs-rejected';
+ 
+   return (
+     <div className="app-layout">
+@@ -597,6 +617,16 @@ const showToast = (msg: string) => {
+                     </span>
+                   )}
+                 </button>
++                <button
++                  className={`nav-sub-item ${activeMenu === 'pcs-rejected' ? 'active' : ''}`}
++                  onClick={() => setActiveMenu('pcs-rejected')}
++                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
++                >
++                  <span>거부 PC</span>
++                  <span className="mono" style={{ fontSize: 11, opacity: 0.6 }}>
++                    {rejected.length}
++                  </span>
++                </button>
+               </div>
+             )}
+           </div>
+@@ -639,6 +669,17 @@ const showToast = (msg: string) => {
+             )}
+           </div>
+ 
++          <button
++            className={`nav-item ${activeMenu === 'notifications' ? 'active' : ''}`}
++            onClick={() => navigateToMenu('notifications')}
++          >
++            <span className="nav-item-left">
++              <Bell size={16} />
++              <span>알림</span>
++            </span>
++            {notifCount > 0 && <span className="badge-count">{notifCount}</span>}
++          </button>
++
+           <button
+             className={`nav-item ${activeMenu === 'logs' ? 'active' : ''}`}
+             onClick={() => navigateToMenu('logs')}
+@@ -662,6 +703,9 @@ const showToast = (msg: string) => {
+ 
+         <div className="sidebar-footer">
+           <div style={{ color: '#10b981', fontWeight: 600 }}>● 관제 서버 정상 가동 중</div>
++          <div style={{ marginTop: 4, fontSize: 11 }}>
++            접속 계정: {username || '-'} · 포트 {state.server?.port ?? '-'}
++          </div>
+           <div style={{ marginTop: 4, fontSize: 11 }}>
+             테마: {THEMES.find((t) => t.key === theme)?.label}
+           </div>
+@@ -796,6 +840,8 @@ const showToast = (msg: string) => {
+                             handleDecision(p.machine_id, true, sel.value);
+                           }}
+                           className="btn btn-approve"
++                          disabled={!p.alive}
++                          title={p.alive ? '' : '에이전트와 통신이 확인되어야 승인할 수 있습니다'}
+                         >
+                           <CheckCircle2 size={14} /> 승인
+                         </button>
+@@ -1028,7 +1074,8 @@ const showToast = (msg: string) => {
+               <div>
+                 <h2 className="page-title">승인 대기 PC ({pending.length}대)</h2>
+                 <p className="page-desc">
+-                  에이전트가 설치되어 등록을 요청한 신규 PC 목록입니다. 인증 토큰을 확인하고 배포 그룹을 지정해 승인하세요.
++                  에이전트가 설치되어 등록을 요청한 신규 PC 목록입니다. 승인 시 해당 PC 에이전트와의 통신을 먼저 확인하며, 응답이
++                  확인된 PC만 등록됩니다.
+                 </p>
+               </div>
+               <div style={{ display: 'flex', gap: 8 }}>
+@@ -1062,6 +1109,13 @@ const showToast = (msg: string) => {
+                         <div className="mono" style={{ fontSize: 11.5, color: 'var(--accent-text)', marginTop: 4 }}>
+                           인증 토큰: {p.token_preview}
+                         </div>
++                        <div style={{ marginTop: 6 }}>
++                          <span className={`badge ${p.alive ? 'badge-ok' : 'badge-warn'}`}>
++                            {p.alive
++                              ? `에이전트 응답 확인됨 (${Math.max(0, Math.round(state.now - p.last_seen))}초 전)`
++                              : `에이전트 응답 대기 중 (최근 ${pendingAliveSec}초 내 통신 없음)`}
++                          </span>
++                        </div>
+                       </div>
+                       <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                         <select id={`pending-ring-${p.machine_id}`} defaultValue="ring1" className="select-dark mono">
+@@ -1524,11 +1578,32 @@ const showToast = (msg: string) => {
+                 )}
+               </div>
+             </section>
++
++            <AccessLogPanel />
+           </>
+         )}
+ 
++        {/* 알림 탭 */}
++        {activeMenu === 'notifications' && (
++          <NotificationsPanel
++            onChanged={fetchState}
++            onOpenPc={(mid) => {
++              const a = agents.find((x) => x.machine_id === mid);
++              if (a) setActiveAgent(a);
++              else if (pending.some((x) => x.machine_id === mid)) setActiveMenu('pcs-pending');
++              else if (rejected.some((x) => x.machine_id === mid)) setActiveMenu('pcs-rejected');
++              else showToast('해당 PC는 현재 관리 목록에 없습니다.');
++            }}
++          />
++        )}
++
++        {/* 거부 PC */}
++        {activeMenu === 'pcs-rejected' && (
++          <RejectedPcs rejected={rejected} onRefresh={fetchState} onToast={showToast} />
++        )}
++
+         {/* ============================================================
+-            5. 설정 탭 (관리자 토큰 관리 + Windows 시작 시 옵션 + 5종 테마)
++            5. 설정 탭 (관리자 계정/비밀번호 + Windows 시작 시 옵션 + 5종 테마)
+            ============================================================ */}
+         {activeMenu === 'settings' && (
+           <>
+@@ -1536,7 +1611,7 @@ const showToast = (msg: string) => {
+               <div>
+                 <h2 className="page-title">콘솔 환경 설정</h2>
+                 <p className="page-desc">
+-                  화면 색상 테마, 관리자 인증 토큰, Windows 시작 시 자동 실행 옵션을 관리합니다.
++                  화면 색상 테마, 관리자 비밀번호, Windows 시작 시 자동 실행 옵션을 관리합니다.
+                 </p>
+               </div>
+             </div>
+@@ -1576,35 +1651,18 @@ const showToast = (msg: string) => {
+               <div className="panel-header">
+                 <h3 className="panel-title">
+                   <KeyRound size={16} style={{ color: 'var(--accent-text)' }} />
+-                  <span>관리자 인증 토큰 관리</span>
++                  <span>관리자 계정 · 비밀번호 변경</span>
+                 </h3>
++                <button onClick={logout} className="btn btn-rose">
++                  <LogOut size={14} /> 로그아웃
++                </button>
+               </div>
+               <p style={{ margin: '0 0 12px', fontSize: 12.5, color: 'var(--text-secondary)' }}>
+-                외부 웹 브라우저에서 관제 서버(`http://서버IP:8080`)에 접속할 때 사용하는 마스터 관리자 토큰입니다.
++                현재 로그인 계정: <strong>{username || '-'}</strong> · 계정 정보는 서버 PC의 별도 계정 DB(aurora_accounts.db)에
++                암호화(해시)되어 저장됩니다. 비밀번호를 변경하면 다른 PC의 로그인 세션은 모두 종료됩니다.
+               </p>
+-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' }}>
+-                <input
+-                  type="text"
+-                  readOnly
+-                  value={token}
+-                  className="input-dark mono"
+-                  style={{ flex: 1, minWidth: 260 }}
+-                />
+-                <button onClick={copyToken} className="btn btn-primary">
+-                  {copied ? <Check size={14} /> : <Copy size={14} />}
+-                  <span>{copied ? '복사 완료' : '토큰 복사'}</span>
+-                </button>
+-                <button
+-                  onClick={() => {
+-                    if (confirm('현재 세션의 관리자 토큰을 해제하고 로그인 화면으로 이동할까요?')) {
+-                      setAdminToken('');
+-                      setTokenState('');
+-                    }
+-                  }}
+-                  className="btn btn-rose"
+-                >
+-                  <LogOut size={14} /> 토큰 로그아웃
+-                </button>
++              <div style={{ maxWidth: 360 }}>
++                <PasswordChangeForm onChanged={() => showToast('✓ 비밀번호가 변경되었습니다.')} />
+               </div>
+             </section>
+ 
+diff --git a/frontend/src/api.ts b/frontend/src/api.ts
+index c4f9bfa..f4da9be 100644
+--- a/frontend/src/api.ts
++++ b/frontend/src/api.ts
+@@ -1,35 +1,71 @@
+-const TOKEN_KEY = 'aurora_admin_token';
++// 콘솔 로그인 세션 (아이디/비밀번호 로그인 후 서버가 발급한 세션 토큰)
++const SESSION_KEY = 'aurora_session';
++const USER_KEY = 'aurora_user';
+ 
+-export function getAdminToken(): string {
+-  return sessionStorage.getItem(TOKEN_KEY) || '';
++export function getSessionToken(): string {
++  return sessionStorage.getItem(SESSION_KEY) || '';
+ }
+ 
+-export function setAdminToken(token: string) {
+-  sessionStorage.setItem(TOKEN_KEY, token.trim());
++export function getSessionUser(): string {
++  return sessionStorage.getItem(USER_KEY) || '';
+ }
+ 
++export function setSession(token: string, username: string) {
++  sessionStorage.setItem(SESSION_KEY, token);
++  sessionStorage.setItem(USER_KEY, username);
++}
++
++export function clearSession() {
++  sessionStorage.removeItem(SESSION_KEY);
++  sessionStorage.removeItem(USER_KEY);
++  sessionStorage.removeItem('aurora_admin_token'); // 이전 버전 토큰 로그인 잔여값 정리
++}
++
++export class ApiError extends Error {
++  status: number;
++  constructor(status: number, message: string) {
++    super(message);
++    this.status = status;
++  }
++}
++
++/**
++ * 오류 규칙
++ *  - 401: 'UNAUTHORIZED' (세션 만료/미로그인)
++ *  - 403 + PASSWORD_CHANGE_REQUIRED: 임시 비밀번호 상태
++ *  - 503: 'NOT_READY' (DB 백업/마이그레이션 진행 중)
++ */
+ export async function apiFetch<T = any>(
+   path: string,
+   body?: Record<string, any>,
+   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+ ): Promise<T> {
+-  const token = getAdminToken();
+   const reqMethod = method || (body !== undefined ? 'POST' : 'GET');
+   const res = await fetch(`/api${path}`, {
+     method: reqMethod,
+     headers: {
+       'Content-Type': 'application/json',
+-      'X-Admin-Token': token,
++      'X-Session-Token': getSessionToken(),
+     },
+     body: reqMethod === 'POST' || reqMethod === 'PUT' ? JSON.stringify(body ?? {}) : undefined,
+   });
+ 
+-  if (res.status === 401 || res.status === 403) {
+-    throw new Error('UNAUTHORIZED');
++  if (res.status === 401 && path !== '/auth/login') {
++    throw new ApiError(401, 'UNAUTHORIZED');
++  }
++  if (res.status === 503) {
++    throw new ApiError(503, 'NOT_READY');
+   }
+   if (!res.ok) {
+     const err = await res.json().catch(() => ({ detail: '요청 처리 실패' }));
+-    throw new Error(err.detail || '요청 처리 실패');
++    throw new ApiError(res.status, err.detail || '요청 처리 실패');
+   }
+   return res.json();
+-}
+\ No newline at end of file
++}
++
++export function errorMessage(e: any): string {
++  if (e?.message === 'NOT_READY') return '서버가 DB를 준비하는 중입니다. 잠시 후 다시 시도하세요.';
++  if (e?.message === 'UNAUTHORIZED') return '로그인이 만료되었습니다. 다시 로그인하세요.';
++  if (e?.message === 'PASSWORD_CHANGE_REQUIRED') return '비밀번호를 먼저 변경해야 합니다.';
++  return e?.message || String(e);
++}
+diff --git a/frontend/src/components/AccessLogPanel.tsx b/frontend/src/components/AccessLogPanel.tsx
+new file mode 100644
+index 0000000..397e960
+--- /dev/null
++++ b/frontend/src/components/AccessLogPanel.tsx
+@@ -0,0 +1,61 @@
++import React, { useEffect, useState } from 'react';
++import { apiFetch } from '../api';
++import { AccessLogItem } from '../types';
++
++const ACTION_LABEL: Record<string, string> = {
++  login: '로그인',
++  login_fail: '로그인 실패',
++  logout: '로그아웃',
++  password_change: '비밀번호 변경',
++};
++
++/** 콘솔 접속 로그 (최근 200건, 7일 보관) */
++export const AccessLogPanel: React.FC = () => {
++  const [rows, setRows] = useState<AccessLogItem[]>([]);
++
++  useEffect(() => {
++    const load = () => apiFetch<AccessLogItem[]>('/access-logs').then(setRows).catch(() => {});
++    load();
++    const id = window.setInterval(load, 30000);
++    return () => window.clearInterval(id);
++  }, []);
++
++  return (
++    <section className="glass-card panel">
++      <div className="panel-header">
++        <h3 className="panel-title">콘솔 접속 로그 (최근 7일)</h3>
++      </div>
++      {rows.length === 0 ? (
++        <div style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>기록이 없습니다.</div>
++      ) : (
++        <div className="table-wrap" style={{ maxHeight: 320, overflow: 'auto' }}>
++          <table className="data-table">
++            <thead>
++              <tr>
++                <th>시각</th>
++                <th>계정</th>
++                <th>IP</th>
++                <th>동작</th>
++                <th>결과</th>
++              </tr>
++            </thead>
++            <tbody>
++              {rows.map((r) => (
++                <tr key={r.id}>
++                  <td className="mono">{new Date(r.ts * 1000).toLocaleString('ko-KR')}</td>
++                  <td>{r.username}</td>
++                  <td className="mono">{r.ip}</td>
++                  <td>{ACTION_LABEL[r.action] || r.action}</td>
++                  <td>
++                    <span className={`badge ${r.ok ? 'badge-ok' : 'badge-danger'}`}>{r.ok ? '성공' : '실패'}</span>
++                    {r.detail && <span style={{ marginLeft: 6, fontSize: 11.5, color: 'var(--text-muted)' }}>{r.detail}</span>}
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      )}
++    </section>
++  );
++};
+diff --git a/frontend/src/components/AgentDrawer.tsx b/frontend/src/components/AgentDrawer.tsx
+index 8b3f5f0..528f779 100644
+--- a/frontend/src/components/AgentDrawer.tsx
++++ b/frontend/src/components/AgentDrawer.tsx
+@@ -1,7 +1,15 @@
+-import React from 'react';
+-import { X, Download, EyeOff, Eye, ShieldOff, RefreshCw, Trash2 } from 'lucide-react';
+-import { Agent } from '../types';
+-import { apiFetch } from '../api';
++import React, { useCallback, useEffect, useState } from 'react';
++import { X, Download, EyeOff, Eye, ShieldOff, RefreshCw, Trash2, History, Undo2, Wrench } from 'lucide-react';
++import { Agent, AgentDetail, RegistryChange } from '../types';
++import { apiFetch, errorMessage } from '../api';
++import {
++  HISTORY_OP,
++  HISTORY_RESULT,
++  describeValue,
++  registryLabel,
++  rollbackPreview,
++  summarizeChange,
++} from '../registryLabels';
+ 
+ interface Props {
+   agent: Agent | null;
+@@ -9,19 +17,85 @@ interface Props {
+   onRefresh: () => void;
+ }
+ 
++const subCard: React.CSSProperties = {
++  background: 'var(--bg-subcard)',
++  border: '1px solid var(--border-subtle)',
++  borderRadius: 10,
++};
++const sectionTitle: React.CSSProperties = {
++  margin: '0 0 10px',
++  fontSize: 13.5,
++  fontWeight: 700,
++  color: 'var(--text-primary)',
++  display: 'flex',
++  alignItems: 'center',
++  gap: 6,
++};
++
++const ROLLBACK_STATE: Record<string, { text: string; cls: string }> = {
++  requested: { text: '롤백 요청됨', cls: 'badge-warn' },
++  done: { text: '롤백 완료', cls: 'badge-ok' },
++  failed: { text: '롤백 실패', cls: 'badge-danger' },
++};
++
++function fmtTs(ts?: number | null) {
++  return ts ? new Date(ts * 1000).toLocaleString('ko-KR') : '-';
++}
++
+ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
++  const [detail, setDetail] = useState<AgentDetail | null>(null);
++  const [detailError, setDetailError] = useState('');
++  const [historyRequested, setHistoryRequested] = useState<'idle' | 'queued' | 'offline'>('idle');
++  const machineId = agent?.machine_id;
++
++  const loadDetail = useCallback(async () => {
++    if (!machineId) return;
++    try {
++      setDetail(await apiFetch<AgentDetail>(`/agents/${encodeURIComponent(machineId)}/detail`));
++      setDetailError('');
++    } catch (e) {
++      setDetailError(errorMessage(e));
++    }
++  }, [machineId]);
++
++  // 모달을 열 때만: 저장된 이력 조회 + 에이전트에 전체 이력 재보고 요청, 열려 있는 동안 5초마다 갱신
++  useEffect(() => {
++    setDetail(null);
++    setHistoryRequested('idle');
++    if (!machineId) return;
++    loadDetail();
++    apiFetch<{ queued: boolean }>(`/agents/${encodeURIComponent(machineId)}/history/refresh`, {})
++      .then((r) => setHistoryRequested(r.queued ? 'queued' : 'offline'))
++      .catch(() => setHistoryRequested('offline'));
++    const id = window.setInterval(loadDetail, 5000);
++    return () => window.clearInterval(id);
++  }, [machineId, loadDetail]);
++
+   if (!agent) return null;
+ 
+   const sendCmd = async (type: string, payload: Record<string, any> = {}) => {
+-    await apiFetch('/commands', { machine_ids: [agent.machine_id], type, payload });
+-    onRefresh();
++    try {
++      const res = await apiFetch<{ dispatched: number; skipped: string[] }>('/commands', {
++        machine_ids: [agent.machine_id],
++        type,
++        payload,
++      });
++      if (res.skipped?.length) alert(`${agent.hostname} PC가 오프라인이라 명령을 보내지 않았습니다.`);
++      onRefresh();
++    } catch (e) {
++      alert(errorMessage(e));
++    }
+   };
+ 
+   const revokeToken = async () => {
+     if (!confirm(`${agent.hostname}의 에이전트 토큰을 폐기하시겠습니까? 재인증 전까지 통신이 차단됩니다.`)) return;
+-    await apiFetch(`/agents/${agent.machine_id}/revoke`, {});
+-    onClose();
+-    onRefresh();
++    try {
++      await apiFetch(`/agents/${encodeURIComponent(agent.machine_id)}/revoke`, {});
++      onClose();
++      onRefresh();
++    } catch (e) {
++      alert(errorMessage(e));
++    }
+   };
+ 
+   const deleteAgent = async () => {
+@@ -32,11 +106,29 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+     ) {
+       return;
+     }
+-    await apiFetch(`/agents/${agent.machine_id}`, undefined, 'DELETE');
+-    onClose();
+-    onRefresh();
++    try {
++      await apiFetch(`/agents/${encodeURIComponent(agent.machine_id)}`, undefined, 'DELETE');
++      onClose();
++      onRefresh();
++    } catch (e) {
++      alert(errorMessage(e));
++    }
+   };
+ 
++  const rollback = async (c: RegistryChange) => {
++    if (!confirm(`${rollbackPreview(c)}\n\n※ 이 PC의 배포 그룹 정책이 다시 변경되면 정책 값이 재적용됩니다.\n진행할까요?`)) return;
++    try {
++      await apiFetch(`/agents/${encodeURIComponent(agent.machine_id)}/registry/${c.id}/rollback`, {});
++      loadDetail();
++    } catch (e) {
++      alert(errorMessage(e));
++    }
++  };
++
++  const online = agent.online ?? detail?.online ?? false;
++  const hist = detail?.hist || [];
++  const changes = detail?.registry_changes || [];
++
+   return (
+     <div className="drawer-backdrop" onClick={onClose}>
+       <div className="drawer-panel" onClick={(e) => e.stopPropagation()}>
+@@ -44,7 +136,10 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+           <div>
+             <h3 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: 'var(--text-primary)' }}>
+-              {agent.hostname}
++              {agent.hostname}{' '}
++              <span className={`badge ${online ? 'badge-ok' : 'badge-danger'}`} style={{ verticalAlign: 'middle' }}>
++                {online ? '온라인' : '오프라인'}
++              </span>
+             </h3>
+             <div className="mono" style={{ marginTop: 4, fontSize: 12, color: 'var(--text-secondary)' }}>
+               {agent.ip} · {agent.os_name} ({agent.os_build})
+@@ -56,18 +151,7 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+         </div>
+ 
+         {/* 요약 메타 카드 */}
+-        <div
+-          style={{
+-            display: 'grid',
+-            gridTemplateColumns: '1fr 1fr',
+-            gap: 12,
+-            background: 'var(--bg-subcard)',
+-            border: '1px solid var(--border-subtle)',
+-            borderRadius: 10,
+-            padding: 14,
+-            fontSize: 12,
+-          }}
+-        >
++        <div style={{ ...subCard, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, padding: 14, fontSize: 12 }}>
+           <div>
+             <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>Machine ID</span>
+             <div className="mono" style={{ color: 'var(--text-primary)', marginTop: 3, fontWeight: 600 }}>
+@@ -88,7 +172,7 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+           </div>
+           <div>
+             <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>설치된 핫픽스</span>
+-            <div className="mono" style={{ color: 'var(--text-primary)', marginTop: 3 }}>
++            <div className="mono" style={{ color: 'var(--text-primary)', marginTop: 3, maxHeight: 60, overflow: 'auto' }}>
+               {agent.hotfix || '확인 중'}
+             </div>
+           </div>
+@@ -96,10 +180,10 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+ 
+         {/* 개별 PC 제어 및 삭제 버튼 */}
+         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+-          <button onClick={() => sendCmd('scan')} className="btn btn-ghost">
++          <button onClick={() => sendCmd('scan')} className="btn btn-ghost" disabled={!online}>
+             <RefreshCw size={13} style={{ color: 'var(--accent-text)' }} /> 즉시 스캔
+           </button>
+-          <button onClick={() => sendCmd('install_all')} className="btn btn-emerald">
++          <button onClick={() => sendCmd('install_all')} className="btn btn-emerald" disabled={!online}>
+             <Download size={13} /> 대기 전체 설치
+           </button>
+           <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+@@ -111,65 +195,47 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+             </button>
+           </div>
+         </div>
++        {!online && (
++          <div style={{ fontSize: 12, color: '#f59e0b' }}>
++            오프라인 PC에는 명령을 보내지 않습니다. (명령은 대기열에 남지 않음)
++          </div>
++        )}
+ 
+         {/* 대기 중인 Windows 업데이트 목록 */}
+         <div>
+-          <h4 style={{ margin: '0 0 10px', fontSize: 13.5, fontWeight: 700, color: 'var(--text-primary)' }}>
+-            대기 중인 Windows 업데이트 ({agent.pend.length}건)
+-          </h4>
++          <h4 style={sectionTitle}>대기 중인 Windows 업데이트 ({agent.pend.length}건)</h4>
+           {agent.pend.length === 0 ? (
+-            <div
+-              style={{
+-                padding: 24,
+-                textAlign: 'center',
+-                background: 'var(--bg-subcard)',
+-                border: '1px solid var(--border-subtle)',
+-                borderRadius: 10,
+-                fontSize: 12,
+-                color: 'var(--text-muted)',
+-              }}
+-            >
++            <div style={{ ...subCard, padding: 24, textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}>
+               현재 대기 중인 업데이트가 없습니다.
+             </div>
+           ) : (
+             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+               {agent.pend.map((u, idx) => (
+-                <div
+-                  key={idx}
+-                  style={{
+-                    background: 'var(--bg-subcard)',
+-                    border: '1px solid var(--border-subtle)',
+-                    borderRadius: 10,
+-                    padding: 13,
+-                    display: 'flex',
+-                    flexDirection: 'column',
+-                    gap: 8,
+-                  }}
+-                >
++                <div key={u.id || idx} style={{ ...subCard, padding: 13, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                     <span className="mono" style={{ fontWeight: 700, color: 'var(--accent-text)', fontSize: 12 }}>
+                       {u.kb || 'KB미상'}
+                     </span>
+-                    <span className={`badge ${u.hidden ? 'badge-danger' : 'badge-ok'}`}>
+-                      {u.hidden ? '숨김(차단됨)' : `${u.size_mb ?? 0} MB`}
++                    <span className={`badge ${u.hid ? 'badge-danger' : 'badge-ok'}`}>
++                      {u.hid ? '숨김(차단됨)' : `${Math.round((u.size || 0) / 1048576)} MB`}
+                     </span>
+                   </div>
+-                  <div style={{ fontSize: 12.5, color: 'var(--text-primary)', lineHeight: 1.45 }}>
+-                    {u.title}
+-                  </div>
++                  <div style={{ fontSize: 12.5, color: 'var(--text-primary)', lineHeight: 1.45 }}>{u.title}</div>
+                   <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+                     <button
+                       onClick={() => sendCmd('install_kb', { kb: u.kb })}
+                       className="btn btn-primary"
+                       style={{ padding: '5px 11px', fontSize: 11.5 }}
++                      disabled={!online}
+                     >
+                       <Download size={12} /> 단독 설치
+                     </button>
+-                    {!u.hidden ? (
++                    {!u.hid ? (
+                       <button
+                         onClick={() => sendCmd('hide_kb', { kb: u.kb })}
+                         className="btn btn-rose"
+                         style={{ padding: '5px 11px', fontSize: 11.5 }}
++                        disabled={!online}
+                       >
+                         <EyeOff size={12} /> 숨기기
+                       </button>
+@@ -178,6 +244,7 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+                         onClick={() => sendCmd('unhide_kb', { kb: u.kb })}
+                         className="btn btn-ghost"
+                         style={{ padding: '5px 11px', fontSize: 11.5 }}
++                        disabled={!online}
+                       >
+                         <Eye size={12} /> 숨김 해제
+                       </button>
+@@ -188,7 +255,109 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
+             </div>
+           )}
+         </div>
++
++        {/* 업데이트 설치/제거 이력 (상세 모달에서만 조회, 최대 100건) */}
++        <div>
++          <h4 style={sectionTitle}>
++            <History size={14} /> 업데이트 설치·제거 이력 ({hist.length}건, 최대 100건)
++          </h4>
++          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 8 }}>
++            {historyRequested === 'queued' && '에이전트에 전체 이력을 요청했습니다. 수 초 후 자동으로 갱신됩니다. · '}
++            {historyRequested === 'offline' && '오프라인이라 최근 보고된 이력을 표시합니다. · '}
++            마지막 갱신: {fmtTs(detail?.hist_ts)}
++          </div>
++          {detailError && <div style={{ fontSize: 12, color: '#f43f5e' }}>{detailError}</div>}
++          {hist.length === 0 ? (
++            <div style={{ ...subCard, padding: 18, textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}>
++              {detail ? '보고된 이력이 없습니다.' : '불러오는 중...'}
++            </div>
++          ) : (
++            <div style={{ ...subCard, maxHeight: 280, overflow: 'auto' }}>
++              <table className="data-table" style={{ fontSize: 12 }}>
++                <thead>
++                  <tr>
++                    <th>일시</th>
++                    <th>구분</th>
++                    <th>KB</th>
++                    <th>결과</th>
++                    <th>제목</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  {hist.map((h, i) => {
++                    const r = HISTORY_RESULT[h.rc ?? -1] || { text: String(h.rc ?? '-'), cls: 'badge-warn' };
++                    return (
++                      <tr key={`${h.id}-${h.date}-${i}`}>
++                        <td className="mono">{h.date ? h.date.replace('T', ' ') : '-'}</td>
++                        <td>{HISTORY_OP[h.op ?? 0] || '-'}</td>
++                        <td className="mono">{h.kb || '-'}</td>
++                        <td>
++                          <span className={`badge ${r.cls}`}>{r.text}</span>
++                        </td>
++                        <td style={{ maxWidth: 260, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={h.title}>
++                          {h.title}
++                        </td>
++                      </tr>
++                    );
++                  })}
++                </tbody>
++              </table>
++            </div>
++          )}
++        </div>
++
++        {/* 레지스트리 변경 이력 + 롤백 */}
++        <div>
++          <h4 style={sectionTitle}>
++            <Wrench size={14} /> 레지스트리 변경 이력 ({changes.length}건)
++          </h4>
++          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 8 }}>
++            정책 적용으로 실제 값이 바뀐 경우만 기록됩니다. 롤백하면 변경 전 값으로 되돌리며, 롤백도 이력에 남습니다.
++          </div>
++          {changes.length === 0 ? (
++            <div style={{ ...subCard, padding: 18, textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}>
++              {detail ? '기록된 레지스트리 변경이 없습니다.' : '불러오는 중...'}
++            </div>
++          ) : (
++            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflow: 'auto' }}>
++              {changes.map((c) => {
++                const st = ROLLBACK_STATE[c.rollback_state];
++                return (
++                  <div key={c.id} style={{ ...subCard, padding: 12, display: 'flex', gap: 10, alignItems: 'flex-start' }}>
++                    <div style={{ flex: 1, minWidth: 0 }}>
++                      <div style={{ fontWeight: 700, fontSize: 12.5 }}>{summarizeChange(c)}</div>
++                      <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 3 }}>
++                        {c.source === 'rollback' ? '롤백으로 변경' : `정책 적용 (${c.policy_hash || '-'})`} · {fmtTs(c.ts)}
++                      </div>
++                      <div className="mono" style={{ fontSize: 10.5, color: 'var(--text-muted)', marginTop: 3, wordBreak: 'break-all' }}>
++                        HKLM\{c.path}\{c.name} : {describeValue(c.name, c.old_exists, c.old_value)} →{' '}
++                        {describeValue(c.name, c.new_exists, c.new_value)}
++                      </div>
++                      {c.rollback_msg && (
++                        <div style={{ fontSize: 11, color: c.rollback_state === 'failed' ? '#f43f5e' : 'var(--text-muted)', marginTop: 3 }}>
++                          {c.rollback_msg}
++                        </div>
++                      )}
++                    </div>
++                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
++                      {st && <span className={`badge ${st.cls}`}>{st.text}</span>}
++                      <button
++                        className="btn btn-amber"
++                        style={{ padding: '5px 10px', fontSize: 11.5 }}
++                        disabled={!online || c.rollback_state === 'requested'}
++                        title={online ? `${registryLabel(c.name)} 변경 전 값으로 되돌리기` : '오프라인 PC는 롤백할 수 없습니다'}
++                        onClick={() => rollback(c)}
++                      >
++                        <Undo2 size={12} /> 롤백
++                      </button>
++                    </div>
++                  </div>
++                );
++              })}
++            </div>
++          )}
++        </div>
+       </div>
+     </div>
+   );
+-};
+\ No newline at end of file
++};
+diff --git a/frontend/src/components/LoginScreen.tsx b/frontend/src/components/LoginScreen.tsx
+new file mode 100644
+index 0000000..7a26897
+--- /dev/null
++++ b/frontend/src/components/LoginScreen.tsx
+@@ -0,0 +1,94 @@
++import React, { useState } from 'react';
++import { LogIn } from 'lucide-react';
++import { apiFetch, errorMessage, setSession } from '../api';
++import { PasswordChangeForm } from './PasswordChangeForm';
++
++interface Props {
++  /** 로그인(및 필요 시 최초 비밀번호 변경)까지 완료되면 호출 */
++  onLoggedIn: (username: string) => void;
++  /** 세션은 있으나 임시 비밀번호 상태로 돌아온 경우 바로 변경 화면 표시 */
++  forcePasswordChange?: boolean;
++  usernameHint?: string;
++}
++
++export const LoginScreen: React.FC<Props> = ({ onLoggedIn, forcePasswordChange, usernameHint }) => {
++  const [username, setUsername] = useState(usernameHint || 'admin');
++  const [password, setPassword] = useState('');
++  const [error, setError] = useState('');
++  const [busy, setBusy] = useState(false);
++  const [mustChange, setMustChange] = useState(Boolean(forcePasswordChange));
++
++  const submit = async (e: React.FormEvent) => {
++    e.preventDefault();
++    setError('');
++    setBusy(true);
++    try {
++      const res = await apiFetch<{ token: string; username: string; must_change: boolean }>('/auth/login', {
++        username,
++        password,
++      });
++      setSession(res.token, res.username);
++      setPassword('');
++      if (res.must_change) setMustChange(true);
++      else onLoggedIn(res.username);
++    } catch (err) {
++      setError(errorMessage(err));
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <div className="login-wrap">
++      <div className="glass-card login-card">
++        <div className="brand-group" style={{ marginBottom: 22 }}>
++          <div className="brand-logo mono">AU</div>
++          <div>
++            <h1 className="brand-title">AURORA Update Control</h1>
++            <p className="brand-sub">엔터프라이즈 패치 및 에이전트 중앙 관제</p>
++          </div>
++        </div>
++
++        {mustChange ? (
++          <PasswordChangeForm firstLogin onChanged={() => onLoggedIn(username)} />
++        ) : (
++          <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
++            <div>
++              <label style={{ display: 'block', fontSize: 12, marginBottom: 6 }}>아이디</label>
++              <input
++                className="input-dark"
++                style={{ width: '100%' }}
++                value={username}
++                onChange={(e) => setUsername(e.target.value)}
++                autoComplete="username"
++              />
++            </div>
++            <div>
++              <label style={{ display: 'block', fontSize: 12, marginBottom: 6 }}>비밀번호</label>
++              <input
++                type="password"
++                className="input-dark"
++                style={{ width: '100%' }}
++                value={password}
++                onChange={(e) => setPassword(e.target.value)}
++                autoComplete="current-password"
++                autoFocus
++              />
++            </div>
++            {error && <div style={{ fontSize: 12.5, color: '#f43f5e' }}>{error}</div>}
++            <button type="submit" className="btn btn-primary" disabled={busy} style={{ width: '100%', padding: 10 }}>
++              <LogIn size={14} /> {busy ? '확인 중...' : '로그인'}
++            </button>
++            <div style={{ fontSize: 11.5, color: 'var(--text-muted)', lineHeight: 1.5 }}>
++              최초 접속 시 임시 비밀번호는 서버 PC의
++              <br />
++              <span className="mono">C:\ProgramData\AURORA\Server\initial_admin_password.txt</span> 에 있습니다.
++              <br />
++              (관리자 권한으로만 열 수 있습니다)
++            </div>
++          </form>
++        )}
++      </div>
++    </div>
++  );
++};
+diff --git a/frontend/src/components/NotificationsPanel.tsx b/frontend/src/components/NotificationsPanel.tsx
+new file mode 100644
+index 0000000..be76d7a
+--- /dev/null
++++ b/frontend/src/components/NotificationsPanel.tsx
+@@ -0,0 +1,123 @@
++import React, { useCallback, useEffect, useState } from 'react';
++import { Bell, CheckCheck, Check, RefreshCw } from 'lucide-react';
++import { apiFetch, errorMessage } from '../api';
++import { NotificationItem } from '../types';
++
++interface Props {
++  onChanged: () => void; // 사이드바 배지 갱신용
++  onOpenPc?: (machineId: string) => void;
++}
++
++const LEVEL_STYLE: Record<string, { label: string; cls: string }> = {
++  info: { label: '안내', cls: 'badge-ok' },
++  warn: { label: '주의', cls: 'badge-warn' },
++  error: { label: '오류', cls: 'badge-danger' },
++};
++
++const CATEGORY_LABEL: Record<string, string> = {
++  register: 'PC 등록',
++  command: '원격 명령',
++  policy: '정책 적용',
++  rollback: '레지스트리 롤백',
++  agent: '에이전트',
++  system: '시스템',
++  security: '보안',
++};
++
++/** 확인이 필요한 이벤트 모음. '확인'을 누르면 서버에서 삭제되어 다시 표시되지 않는다. */
++export const NotificationsPanel: React.FC<Props> = ({ onChanged, onOpenPc }) => {
++  const [items, setItems] = useState<NotificationItem[]>([]);
++  const [error, setError] = useState('');
++
++  const load = useCallback(async () => {
++    try {
++      setItems(await apiFetch<NotificationItem[]>('/notifications'));
++      setError('');
++    } catch (e) {
++      setError(errorMessage(e));
++    }
++  }, []);
++
++  useEffect(() => {
++    load();
++    const id = window.setInterval(load, 10000);
++    return () => window.clearInterval(id);
++  }, [load]);
++
++  const ack = async (ids?: number[]) => {
++    try {
++      await apiFetch('/notifications/ack', ids ? { ids } : {});
++      setItems((prev) => (ids ? prev.filter((n) => !ids.includes(n.id)) : []));
++      onChanged();
++    } catch (e) {
++      setError(errorMessage(e));
++    }
++  };
++
++  return (
++    <>
++      <div className="page-header">
++        <div>
++          <h2 className="page-title">알림</h2>
++          <p className="page-desc">
++            확인이 필요한 이벤트(신규 등록 요청, 명령·정책 실패, 롤백 결과, 보안 경고 등)를 모아 보여줍니다. 확인한 알림은 바로
++            삭제되며, 확인하지 않은 알림도 7일이 지나면 자동 정리됩니다.
++          </p>
++        </div>
++        <div style={{ display: 'flex', gap: 8 }}>
++          <button onClick={load} className="btn btn-ghost">
++            <RefreshCw size={13} /> 새로고침
++          </button>
++          <button onClick={() => ack()} className="btn btn-primary" disabled={!items.length}>
++            <CheckCheck size={14} /> 모두 확인
++          </button>
++        </div>
++      </div>
++      {error && <div style={{ color: '#f43f5e', fontSize: 12.5, marginBottom: 10 }}>{error}</div>}
++      <section className="glass-card panel">
++        {items.length === 0 ? (
++          <div style={{ padding: 48, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
++            <Bell size={28} style={{ marginBottom: 8 }} />
++            <div>확인할 알림이 없습니다.</div>
++          </div>
++        ) : (
++          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
++            {items.map((n) => {
++              const lv = LEVEL_STYLE[n.level] || LEVEL_STYLE.info;
++              return (
++                <div
++                  key={n.id}
++                  style={{
++                    display: 'flex', gap: 12, alignItems: 'flex-start', padding: 12,
++                    background: 'var(--bg-subcard)', border: '1px solid var(--border-subtle)', borderRadius: 10,
++                  }}
++                >
++                  <span className={`badge ${lv.cls}`}>{lv.label}</span>
++                  <div style={{ flex: 1, minWidth: 0 }}>
++                    <div style={{ fontWeight: 700, fontSize: 13 }}>{n.title}</div>
++                    {n.message && (
++                      <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 3, wordBreak: 'break-all' }}>
++                        {n.message}
++                      </div>
++                    )}
++                    <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
++                      {new Date(n.ts * 1000).toLocaleString('ko-KR')} · {CATEGORY_LABEL[n.category] || n.category}
++                    </div>
++                  </div>
++                  {n.machine_id && onOpenPc && (
++                    <button className="btn btn-ghost" style={{ padding: '5px 10px', fontSize: 11.5 }} onClick={() => onOpenPc(n.machine_id)}>
++                      PC 보기
++                    </button>
++                  )}
++                  <button className="btn btn-ghost" style={{ padding: '5px 10px', fontSize: 11.5 }} onClick={() => ack([n.id])}>
++                    <Check size={12} /> 확인
++                  </button>
++                </div>
++              );
++            })}
++          </div>
++        )}
++      </section>
++    </>
++  );
++};
+diff --git a/frontend/src/components/PasswordChangeForm.tsx b/frontend/src/components/PasswordChangeForm.tsx
+new file mode 100644
+index 0000000..d4e8227
+--- /dev/null
++++ b/frontend/src/components/PasswordChangeForm.tsx
+@@ -0,0 +1,82 @@
++import React, { useState } from 'react';
++import { KeyRound } from 'lucide-react';
++import { apiFetch, errorMessage } from '../api';
++
++interface Props {
++  /** 최초 로그인(임시 비밀번호) 안내 문구 표시 여부 */
++  firstLogin?: boolean;
++  onChanged: () => void;
++}
++
++export const PasswordChangeForm: React.FC<Props> = ({ firstLogin, onChanged }) => {
++  const [current, setCurrent] = useState('');
++  const [next, setNext] = useState('');
++  const [confirm, setConfirm] = useState('');
++  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
++  const [busy, setBusy] = useState(false);
++
++  const submit = async (e: React.FormEvent) => {
++    e.preventDefault();
++    if (next.length < 8) return setMsg({ ok: false, text: '새 비밀번호는 8자 이상이어야 합니다.' });
++    if (next !== confirm) return setMsg({ ok: false, text: '새 비밀번호 확인이 일치하지 않습니다.' });
++    setBusy(true);
++    try {
++      const res = await apiFetch<{ message: string }>('/auth/password', {
++        current_password: current,
++        new_password: next,
++      });
++      setMsg({ ok: true, text: res.message });
++      setCurrent('');
++      setNext('');
++      setConfirm('');
++      onChanged();
++    } catch (err) {
++      setMsg({ ok: false, text: errorMessage(err) });
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
++      {firstLogin && (
++        <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
++          임시 비밀번호로 로그인했습니다. 계속하려면 새 비밀번호를 설정하세요.
++          <br />
++          변경 후 서버 PC의 <span className="mono">initial_admin_password.txt</span> 파일은 자동 삭제됩니다.
++        </div>
++      )}
++      <input
++        type="password"
++        className="input-dark"
++        placeholder="현재 비밀번호"
++        value={current}
++        onChange={(e) => setCurrent(e.target.value)}
++        autoComplete="current-password"
++        autoFocus
++      />
++      <input
++        type="password"
++        className="input-dark"
++        placeholder="새 비밀번호 (8자 이상)"
++        value={next}
++        onChange={(e) => setNext(e.target.value)}
++        autoComplete="new-password"
++      />
++      <input
++        type="password"
++        className="input-dark"
++        placeholder="새 비밀번호 확인"
++        value={confirm}
++        onChange={(e) => setConfirm(e.target.value)}
++        autoComplete="new-password"
++      />
++      {msg && (
++        <div style={{ fontSize: 12.5, color: msg.ok ? '#10b981' : '#f43f5e' }}>{msg.text}</div>
++      )}
++      <button type="submit" className="btn btn-primary" disabled={busy} style={{ alignSelf: 'flex-start' }}>
++        <KeyRound size={14} /> {busy ? '변경 중...' : '비밀번호 변경'}
++      </button>
++    </form>
++  );
++};
+diff --git a/frontend/src/components/RejectedPcs.tsx b/frontend/src/components/RejectedPcs.tsx
+new file mode 100644
+index 0000000..fa210fb
+--- /dev/null
++++ b/frontend/src/components/RejectedPcs.tsx
+@@ -0,0 +1,85 @@
++import React from 'react';
++import { RefreshCw, Undo2, ShieldX } from 'lucide-react';
++import { apiFetch, errorMessage } from '../api';
++import { Agent } from '../types';
++
++interface Props {
++  rejected: Agent[];
++  onRefresh: () => void;
++  onToast: (msg: string) => void;
++}
++
++/** 승인 거부된 PC 목록. '거부 해제' 시 승인 대기 목록으로 이동하고, 에이전트 응답이 확인되면 승인할 수 있다. */
++export const RejectedPcs: React.FC<Props> = ({ rejected, onRefresh, onToast }) => {
++  const unreject = async (a: Agent) => {
++    if (!confirm(`[${a.hostname}] PC를 거부 목록에서 제거하고 승인 대기로 되돌릴까요?`)) return;
++    try {
++      await apiFetch(`/agents/${encodeURIComponent(a.machine_id)}/unreject`, {});
++      onToast(`✓ ${a.hostname}: 승인 대기로 이동했습니다. 에이전트 응답이 확인되면 승인할 수 있습니다.`);
++      onRefresh();
++    } catch (e) {
++      alert(errorMessage(e));
++    }
++  };
++
++  return (
++    <>
++      <div className="page-header">
++        <div>
++          <h2 className="page-title">거부 PC</h2>
++          <p className="page-desc">
++            등록이 거부된 PC 목록입니다. 거부된 PC의 에이전트는 30초마다 등록을 재시도하며, 목록에서 제거하면 승인 대기로
++            돌아갑니다.
++          </p>
++        </div>
++        <button onClick={onRefresh} className="btn btn-ghost">
++          <RefreshCw size={13} /> 새로고침
++        </button>
++      </div>
++      <section className="glass-card panel">
++        {rejected.length === 0 ? (
++          <div style={{ padding: 48, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
++            <ShieldX size={28} style={{ marginBottom: 8 }} />
++            <div>거부된 PC가 없습니다.</div>
++          </div>
++        ) : (
++          <div className="table-wrap">
++            <table className="data-table">
++              <thead>
++                <tr>
++                  <th>PC 이름</th>
++                  <th>IP</th>
++                  <th>OS</th>
++                  <th>에이전트 응답</th>
++                  <th style={{ textAlign: 'right' }}>관리</th>
++                </tr>
++              </thead>
++              <tbody>
++                {rejected.map((a) => (
++                  <tr key={a.machine_id}>
++                    <td>
++                      <strong>{a.hostname}</strong>
++                      <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>{a.machine_id}</div>
++                    </td>
++                    <td className="mono">{a.ip}</td>
++                    <td>{a.os_name}</td>
++                    <td>
++                      <span className={`badge ${a.alive ? 'badge-ok' : 'badge-warn'}`}>
++                        {a.alive ? '재등록 시도 중' : '응답 없음'}
++                      </span>
++                    </td>
++                    <td style={{ textAlign: 'right' }}>
++                      <button className="btn btn-ghost" onClick={() => unreject(a)}>
++                        <Undo2 size={13} /> 거부 해제 (승인 대기로)
++                      </button>
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        )}
++      </section>
++    </>
++  );
++};
+diff --git a/frontend/src/components/StartupLoading.tsx b/frontend/src/components/StartupLoading.tsx
+new file mode 100644
+index 0000000..64e6b4e
+--- /dev/null
++++ b/frontend/src/components/StartupLoading.tsx
+@@ -0,0 +1,92 @@
++import React, { useEffect, useRef, useState } from 'react';
++import { CheckCircle2, Loader2, AlertTriangle } from 'lucide-react';
++import { apiFetch, errorMessage } from '../api';
++import { SystemStatus } from '../types';
++
++interface Props {
++  onReady: () => void;
++  onUnauthorized: () => void;
++}
++
++const MIN_SHOW_MS = 1200; // 너무 빨리 지나가 화면이 깜빡이지 않도록 최소 표시 시간
++
++/** 로그인 직후: 서버의 DB 백업/구조 갱신/PC 로딩 진행 상황을 보여주는 로딩 화면 */
++export const StartupLoading: React.FC<Props> = ({ onReady, onUnauthorized }) => {
++  const [status, setStatus] = useState<SystemStatus | null>(null);
++  const [fetchError, setFetchError] = useState('');
++  const startedAt = useRef(Date.now());
++
++  useEffect(() => {
++    let stop = false;
++    let timer: number | undefined;
++    const poll = async () => {
++      try {
++        const st = await apiFetch<SystemStatus>('/system/status');
++        if (stop) return;
++        setStatus(st);
++        setFetchError('');
++        if (st.ready) {
++          const wait = Math.max(0, MIN_SHOW_MS - (Date.now() - startedAt.current));
++          timer = window.setTimeout(() => !stop && onReady(), wait);
++          return;
++        }
++        if (st.phase === 'error') return; // 오류 시 폴링 중단 (화면에 안내)
++      } catch (e: any) {
++        if (e?.message === 'UNAUTHORIZED') return onUnauthorized();
++        setFetchError(errorMessage(e));
++      }
++      timer = window.setTimeout(poll, 700);
++    };
++    poll();
++    return () => {
++      stop = true;
++      if (timer) window.clearTimeout(timer);
++    };
++  }, [onReady, onUnauthorized]);
++
++  const steps = status?.steps || [];
++  const isError = status?.phase === 'error';
++
++  return (
++    <div className="login-wrap">
++      <div className="glass-card login-card" style={{ minWidth: 420 }}>
++        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
++          {isError ? (
++            <AlertTriangle size={20} style={{ color: '#f43f5e' }} />
++          ) : status?.ready ? (
++            <CheckCircle2 size={20} style={{ color: '#10b981' }} />
++          ) : (
++            <Loader2 size={20} className="spin" style={{ color: 'var(--accent-text)' }} />
++          )}
++          <strong style={{ fontSize: 15 }}>
++            {isError ? 'DB 준비 중 문제가 발생했습니다' : status?.ready ? '준비 완료' : '관제 서버를 준비하고 있습니다'}
++          </strong>
++        </div>
++        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12.5 }}>
++          {steps.length === 0 && <div style={{ color: 'var(--text-secondary)' }}>서버 상태를 확인하는 중입니다...</div>}
++          {steps.map((s, i) => {
++            const last = i === steps.length - 1;
++            return (
++              <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'center', color: last ? 'var(--text-primary)' : 'var(--text-secondary)' }}>
++                {last && !status?.ready && !isError ? (
++                  <Loader2 size={13} className="spin" />
++                ) : (
++                  <CheckCircle2 size={13} style={{ color: '#10b981' }} />
++                )}
++                <span>{s.message}</span>
++              </div>
++            );
++          })}
++        </div>
++        {isError && (
++          <div style={{ marginTop: 14, fontSize: 12, color: '#f43f5e', lineHeight: 1.5 }}>
++            {status?.error}
++            <br />
++            백업 파일: <span className="mono">{status?.backup_file || '없음'}</span> (서버 데이터 폴더의 backups)
++          </div>
++        )}
++        {fetchError && <div style={{ marginTop: 12, fontSize: 12, color: '#f59e0b' }}>{fetchError}</div>}
++      </div>
++    </div>
++  );
++};
+diff --git a/frontend/src/index.css b/frontend/src/index.css
+index d5b6192..3eae2c7 100644
+--- a/frontend/src/index.css
++++ b/frontend/src/index.css
+@@ -755,4 +755,17 @@ body {
+   width: 100%;
+   max-width: 420px;
+   padding: 32px;
+-}
+\ No newline at end of file
++}
++/* 로딩 아이콘 회전 (StartupLoading) */
++.spin {
++  animation: aurora-spin 1s linear infinite;
++}
++@keyframes aurora-spin {
++  to {
++    transform: rotate(360deg);
++  }
++}
++.btn:disabled {
++  opacity: 0.45;
++  cursor: not-allowed;
++}
+diff --git a/frontend/src/registryLabels.ts b/frontend/src/registryLabels.ts
+new file mode 100644
+index 0000000..991da79
+--- /dev/null
++++ b/frontend/src/registryLabels.ts
+@@ -0,0 +1,86 @@
++import { RegistryChange } from './types';
++
++/** 레지스트리 정책 값을 사람이 읽기 쉬운 한국어로 바꾸기 위한 사전 */
++interface LabelDef {
++  label: string;
++  describe?: (v: any) => string;
++}
++
++const onOff = (on: string, off: string) => (v: any) => (Number(v) === 1 ? on : Number(v) === 0 ? off : String(v));
++
++export const REGISTRY_LABELS: Record<string, LabelDef> = {
++  DeferQualityUpdates: { label: '품질(보안) 업데이트 설치 지연', describe: onOff('사용', '사용 안 함') },
++  DeferQualityUpdatesPeriodInDays: { label: '품질 업데이트 지연 일수', describe: (v) => `${v}일` },
++  DeferFeatureUpdates: { label: '기능 업데이트 설치 지연', describe: onOff('사용', '사용 안 함') },
++  DeferFeatureUpdatesPeriodInDays: { label: '기능 업데이트 지연 일수', describe: (v) => `${v}일` },
++  ProductVersion: { label: '고정 대상 제품', describe: (v) => String(v) },
++  TargetReleaseVersion: { label: '기능 업데이트 버전 고정', describe: onOff('사용', '사용 안 함') },
++  TargetReleaseVersionInfo: { label: '고정 대상 버전', describe: (v) => String(v) },
++  ExcludeWUDriversInQualityUpdate: {
++    label: 'Windows 업데이트로 드라이버 설치',
++    describe: onOff('차단', '허용'),
++  },
++  NoAutoRebootWithLoggedOnUsers: {
++    label: '로그인 중 자동 재부팅',
++    describe: onOff('방지', '허용'),
++  },
++  DisableOSUpgrade: { label: 'OS 업그레이드 제안', describe: onOff('차단', '허용') },
++  NoAutoUpdate: { label: 'Windows 자동 업데이트', describe: onOff('끔', '켬') },
++  AUOptions: {
++    label: '자동 업데이트 동작 방식',
++    describe: (v) =>
++      ({ 2: '다운로드 전 알림', 3: '자동 다운로드 후 설치 알림', 4: '자동 다운로드 및 예약 설치', 5: '로컬 관리자 선택' } as Record<
++        number,
++        string
++      >)[Number(v)] || String(v),
++  },
++};
++
++const REG_TYPE_NAMES: Record<number, string> = {
++  1: '문자열',
++  2: '확장 문자열',
++  3: '바이너리',
++  4: '숫자(DWORD)',
++  7: '다중 문자열',
++  11: '숫자(QWORD)',
++};
++
++export function registryLabel(name: string): string {
++  return REGISTRY_LABELS[name]?.label || name;
++}
++
++export function describeValue(name: string, exists: boolean, value: any): string {
++  if (!exists) return '설정 없음';
++  if (value && typeof value === 'object' && '__hex__' in value) return `바이너리(${String(value.__hex__).length / 2}바이트)`;
++  const def = REGISTRY_LABELS[name];
++  return def?.describe ? def.describe(value) : String(value);
++}
++
++export function regTypeName(t: number | null | undefined): string {
++  return t == null ? '-' : REG_TYPE_NAMES[t] || `형식 ${t}`;
++}
++
++/** 예) "품질 업데이트 지연 일수: 7일 → 14일" */
++export function summarizeChange(c: RegistryChange): string {
++  const before = describeValue(c.name, c.old_exists, c.old_value);
++  const after = describeValue(c.name, c.new_exists, c.new_value);
++  return `${registryLabel(c.name)}: ${before} → ${after}`;
++}
++
++/** 롤백하면 어떻게 되는지 안내 문구 */
++export function rollbackPreview(c: RegistryChange): string {
++  const before = describeValue(c.name, c.old_exists, c.old_value);
++  return c.old_exists
++    ? `'${registryLabel(c.name)}' 값을 변경 전 값(${before})으로 되돌립니다.`
++    : `'${registryLabel(c.name)}' 값을 삭제해 변경 전처럼 '설정 없음' 상태로 되돌립니다.`;
++}
++
++export const HISTORY_OP: Record<number, string> = { 1: '설치', 2: '제거', 3: '기타' };
++export const HISTORY_RESULT: Record<number, { text: string; cls: string }> = {
++  0: { text: '시작 안 됨', cls: 'badge-warn' },
++  1: { text: '진행 중', cls: 'badge-warn' },
++  2: { text: '성공', cls: 'badge-ok' },
++  3: { text: '부분 성공', cls: 'badge-warn' },
++  4: { text: '실패', cls: 'badge-danger' },
++  5: { text: '중단됨', cls: 'badge-danger' },
++};
+diff --git a/frontend/src/types.ts b/frontend/src/types.ts
+index 7fd3afa..965b921 100644
+--- a/frontend/src/types.ts
++++ b/frontend/src/types.ts
+@@ -1,16 +1,17 @@
++/** 에이전트가 보고하는 Windows 업데이트 항목 (대기/이력 공용) */
+ export interface UpdateItem {
+   id?: string;
+   kb: string;
+   title: string;
+-  size?: number;
++  size?: number; // 바이트
+   sev?: string;
+   cat?: string;
+-  hid?: boolean;
++  hid?: boolean; // 숨김(차단) 여부
+   dl?: boolean;
+   rb?: boolean;
+   date?: string;
+-  rc?: number;
+-  op?: number;
++  rc?: number; // 결과 코드: 2 성공, 3 부분 성공, 4 실패, 5 중단
++  op?: number; // 1 설치, 2 제거
+ }
+ 
+ export interface Agent {
+@@ -26,13 +27,15 @@ export interface Agent {
+   status: 'pending' | 'active' | 'rejected';
+   ring: string;
+   last_seen: number;
++  online?: boolean;
++  alive?: boolean; // 승인 대기/거부 PC가 최근 등록 요청을 보냈는지 (통신 확인)
+   applied_hash: string;
+   target_hash?: string;
+   reboot_required: boolean;
+   hotfix: string;
+   agent_ver: string;
+   pend: UpdateItem[];
+-  hist: UpdateItem[];
++  hist_count?: number;
+   upd_ts?: number;
+ }
+ 
+@@ -58,23 +61,6 @@ export interface EventLog {
+   msg: string;
+ }
+ 
+-export interface DashboardState {
+-  now: number;
+-  agents: Agent[];
+-  pending_agents: Agent[];
+-  policies: Record<string, { items: PolicyItem[]; hash: string }>;
+-  rules: KbRule[];
+-  events: EventLog[];
+-}
+-
+-export interface UpdateItem {
+-  kb: string;
+-  title: string;
+-  hidden?: boolean;
+-  size_mb?: number;
+-  status?: string;
+-}
+-
+ export interface CatalogItem {
+   kb: string;
+   title: string;
+@@ -87,7 +73,73 @@ export interface CatalogItem {
+ }
+ 
+ export interface DashboardState {
+-  // ... 기존 필드들 (agents, policies, kb_rules, events 등) 유지 ...
++  now: number;
++  agents: Agent[];
++  pending_agents: Agent[];
++  rejected_agents: Agent[];
++  policies: Record<string, { items: PolicyItem[]; hash: string }>;
++  rules: KbRule[];
++  events: EventLog[];
+   catalog?: CatalogItem[];
++  notification_count: number;
+   defaults?: { target_release: string };
+-}
+\ No newline at end of file
++  server?: { host: string; port: number };
++  limits?: { online_sec: number; pending_alive_sec: number; retention_days: number; history_keep: number };
++}
++
++export interface RegistryChange {
++  id: number;
++  ts: number;
++  source: 'policy' | 'rollback';
++  policy_hash: string;
++  path: string;
++  name: string;
++  op: 'set' | 'delete';
++  old_exists: boolean;
++  old_type: number | null;
++  old_value: any;
++  new_exists: boolean;
++  new_type: number | null;
++  new_value: any;
++  rollback_state: '' | 'requested' | 'done' | 'failed';
++  rollback_ts?: number | null;
++  rollback_msg?: string;
++}
++
++export interface AgentDetail {
++  machine_id: string;
++  online: boolean;
++  hist: UpdateItem[];
++  hist_ts?: number | null;
++  registry_changes: RegistryChange[];
++}
++
++export interface NotificationItem {
++  id: number;
++  ts: number;
++  level: 'info' | 'warn' | 'error';
++  category: string;
++  title: string;
++  message: string;
++  machine_id: string;
++}
++
++export interface AccessLogItem {
++  id: number;
++  ts: number;
++  username: string;
++  ip: string;
++  action: string;
++  ok: boolean;
++  detail: string;
++}
++
++export interface SystemStatus {
++  ready: boolean;
++  phase: string;
++  message: string;
++  steps: { ts: number; phase: string; message: string }[];
++  error: string;
++  backup_file: string;
++  rebuilt_tables: string[];
++}
+diff --git a/frontend/vite.config.ts b/frontend/vite.config.ts
+index af8619b..0bf394d 100644
+--- a/frontend/vite.config.ts
++++ b/frontend/vite.config.ts
+@@ -8,7 +8,7 @@ export default defineConfig({
+     port: 5173,
+     proxy: {
+       '/api': {
+-        target: 'http://127.0.0.1:8080',
++        target: 'http://127.0.0.1:1557',
+         changeOrigin: true,
+       },
+     },

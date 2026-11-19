@@ -8,3 +8,12 @@ release/
 *.msi
 *.blockmap
 .env
+# --- 관제 서버 비밀 정보 (관리자 토큰 / 계정 DB / 최초 비밀번호) ---
+admin_token.json
+**/admin_token.json
+aurora_accounts.db
+aurora_accounts.db-*
+**/aurora_accounts.db
+**/aurora_accounts.db-*
+initial_admin_password.txt
+**/initial_admin_password.txt

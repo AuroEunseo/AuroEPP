@@ -13,8 +13,12 @@ IS_WIN = sys.platform == "win32"
 if IS_WIN:
     import winreg
 
-STATE_DIR = r"C:\ProgramData\AURORA" if IS_WIN else os.path.expanduser("~/.aurora")
+from config import DATA_DIR as STATE_DIR  # noqa: E402  (서비스·트레이와 같은 데이터 폴더)
+from agent_log import get_logger  # noqa: E402
+
 IDENTITY_FILE = os.path.join(STATE_DIR, "identity.json")
+IDENTITY_BACKUP = IDENTITY_FILE + ".bak"
+log = get_logger()
 
 
 def _reg_read(path: str, name: str):
@@ -53,34 +57,65 @@ def get_os_info() -> tuple[str, str]:
     return prod_name, build_str
 
 
+def _read_identity(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("machine_id") and data.get("agent_token"):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _write_identity(ident: dict) -> None:
+    """원자적 저장: 임시 파일에 쓴 뒤 교체 + 백업 사본 유지
+    (전원이 갑자기 꺼져 파일이 깨져도 토큰을 잃지 않도록 → 재승인 없이 재연결)"""
+    tmp = IDENTITY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ident, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, IDENTITY_FILE)
+    try:
+        with open(IDENTITY_BACKUP, "w", encoding="utf-8") as f:
+            json.dump(ident, f, indent=2)
+    except OSError:
+        pass
+
+
 def get_or_create_identity(force_new_token: bool = False) -> dict:
-    """로컬에 저장된 토큰이 없으면 자체 발급하여 저장"""
+    """로컬에 저장된 토큰이 없을 때만 자체 발급 (force_new_token: 서버가 토큰 불일치(401)를 알린 경우)"""
     os.makedirs(STATE_DIR, exist_ok=True)
-    if not force_new_token and os.path.exists(IDENTITY_FILE):
-        try:
-            with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if data.get("machine_id") and data.get("agent_token"):
-                    return data
-        except Exception:
-            pass
+    if not force_new_token:
+        data = _read_identity(IDENTITY_FILE)
+        if data:
+            return data
+        data = _read_identity(IDENTITY_BACKUP)
+        if data:
+            log.warning("identity.json 손상/누락 → 백업에서 복구 (기존 토큰 유지)")
+            _write_identity(data)
+            return data
 
     ident = {
         "machine_id": get_machine_id(),
         "agent_token": secrets.token_urlsafe(32),
     }
-    with open(IDENTITY_FILE, "w", encoding="utf-8") as f:
-        json.dump(ident, f, indent=2)
+    _write_identity(ident)
+    log.warning("새 에이전트 토큰 발급 (%s) → 콘솔에서 재승인 필요", "서버 요청" if force_new_token else "최초 실행")
     return ident
 
 
-def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None, wait_fn=None) -> dict:
+def wait_for_approval(server_url, agent_ver: str = "1.0", stop_event=None, wait_fn=None) -> dict:
     """서버에 토큰·PC이름·OS버전을 등록하고 콘솔 관리자가 승인할 때까지 대기
 
+    server_url: 주소 문자열 또는 주소를 돌려주는 함수(설정 변경을 매 요청마다 반영)
     wait_fn: 대기 함수(초 단위). 지정 시 서비스 중지/즉시 동기화 요청에 바로 반응한다.
     """
     sleep = wait_fn or time.sleep
     ident = get_or_create_identity()
+    net_backoff = 2  # 부팅 직후 네트워크가 늦게 올라오는 경우를 위해 짧게 시작해 15초까지 늘림
+    last_state = None
 
     while True:
         if stop_event and stop_event.is_set():
@@ -98,20 +133,33 @@ def wait_for_approval(server_url: str, agent_ver: str = "1.0", stop_event=None, 
 
         try:
             req = urllib.request.Request(
-                f"{server_url}/api/agents/register",
+                f"{server_url() if callable(server_url) else server_url}/api/agents/register",
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=12) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
-                if res.get("status") == "active":
-                    return ident
+            net_backoff = 2
+            status = res.get("status")
+            if status != last_state:
+                log.info("등록 상태: %s", status)
+                last_state = status
+            if status == "active":
+                return ident
         except urllib.error.HTTPError as e:
+            net_backoff = 2
             if e.code == 403:
-                # 거부된 경우 60초 후 재시도
-                sleep(60)
+                if last_state != "rejected":
+                    log.warning("등록 거부 상태 (콘솔에서 거부 해제 필요)")
+                    last_state = "rejected"
+                # 거부된 경우 30초 후 재시도 (콘솔에서 거부 해제 시 30초 이내 '응답 확인됨' 표시)
+                sleep(30)
                 continue
-        except Exception:
-            pass
+            log.warning("등록 요청 실패: HTTP %s", e.code)
+        except Exception as e:
+            log.warning("서버 연결 실패 (%ss 후 재시도): %s", net_backoff, e)
+            sleep(net_backoff)
+            net_backoff = min(net_backoff * 2, 15)
+            continue
 
         sleep(15)

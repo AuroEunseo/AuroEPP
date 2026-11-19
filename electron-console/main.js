@@ -1,5 +1,5 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, dialog, ipcMain } = require('electron');
-const { spawn, exec } = require('child_process');
+const { spawn, exec, execFile } = require('child_process');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -8,7 +8,22 @@ let serverProcess = null;
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
-const PORT = 8080;
+// 관제 서버 설정의 단일 지점: 서버 엔진과 같은 server_config.json 을 읽는다
+const SERVER_DATA_DIR = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA', 'Server');
+const SERVER_CONFIG_FILE = path.join(SERVER_DATA_DIR, 'server_config.json');
+const DEFAULT_PORT = 1557;
+const AUTOSTART_TASK = 'AURORA Control Console';
+const STARTUP_ARG = '--minimized';
+
+function readServerPort() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(SERVER_CONFIG_FILE, 'utf8'));
+    const p = parseInt(cfg.port, 10);
+    if (p >= 1 && p <= 65535) return p;
+  } catch (e) {}
+  return DEFAULT_PORT;
+}
+const PORT = readServerPort();
 // 로그인 자동 시작(--minimized) 시에는 창을 띄우지 않고 트레이로 시작
 const START_MINIMIZED = process.argv.includes('--minimized') || process.argv.includes('--hidden');
 
@@ -21,7 +36,8 @@ function startBackendServer() {
     ? path.join(process.resourcesPath, 'AuroraServerEngine', 'AuroraServerEngine.exe')
     : path.join(__dirname, 'resources', 'AuroraServerEngine', 'AuroraServerEngine.exe');
 
-  serverProcess = spawn(serverExe, [String(PORT)], {
+  // 포트/주소는 서버 엔진이 server_config.json 에서 직접 읽는다 (인수로 넘기지 않음)
+  serverProcess = spawn(serverExe, [], {
     cwd: path.dirname(serverExe),
     windowsHide: true,
   });
@@ -29,7 +45,7 @@ function startBackendServer() {
   serverProcess.on('error', (err) => {
     if (err.code === 'EACCES') {
       exec(
-        `powershell -NoProfile -Command "Start-Process -FilePath '${serverExe}' -ArgumentList '${PORT}' -WorkingDirectory '${path.dirname(serverExe)}' -Verb RunAs -WindowStyle Hidden"`
+        `powershell -NoProfile -Command "Start-Process -FilePath '${serverExe}' -WorkingDirectory '${path.dirname(serverExe)}' -Verb RunAs -WindowStyle Hidden"`
       );
       return;
     }
@@ -51,14 +67,37 @@ function waitForServer(url, retries = 35) {
   });
 }
 
-function readLocalAdminToken() {
-  const tokenPath = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA', 'Server', 'admin_token.json');
-  try {
-    if (fs.existsSync(tokenPath)) {
-      return JSON.parse(fs.readFileSync(tokenPath, 'utf8')).admin_token || '';
-    }
-  } catch (e) {}
-  return '';
+function getAutostartScriptPath() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'tasks', 'aurora-autostart.ps1')
+    : path.join(__dirname, 'resources', 'tasks', 'aurora-autostart.ps1');
+}
+
+// 콘솔 자동 시작: 관리자 권한 앱이므로 작업 스케줄러(현재 사용자 로그온, 가장 높은 권한)로 등록
+function runAutostartTask(action) {
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', getAutostartScriptPath(),
+        '-Action', action,
+        '-TaskName', AUTOSTART_TASK,
+        '-Exe', process.execPath,
+        '-Arguments', STARTUP_ARG,
+        '-Scope', 'CurrentUser',
+      ],
+      { windowsHide: true },
+      (err, stdout) => {
+        const out = String(stdout || '').trim();
+        resolve({
+          ok: !err && !out.startsWith('ERROR'),
+          registered: out.includes('REGISTERED') && !out.includes('NOT_'),
+          message: out,
+        });
+      }
+    );
+  });
 }
 
 function createTray() {
@@ -139,18 +178,9 @@ async function createWindow() {
   });
 
   try {
-    await waitForServer(`http://127.0.0.1:${PORT}/docs`);
+    await waitForServer(`http://127.0.0.1:${PORT}/api/health`);
+    // 로그인은 아이디/비밀번호로 진행 (관리자 토큰 자동 주입 제거)
     await mainWindow.loadURL(`http://127.0.0.1:${PORT}`);
-
-    const localToken = readLocalAdminToken();
-    if (localToken) {
-      await mainWindow.webContents.executeJavaScript(`
-        if (!sessionStorage.getItem('aurora_admin_token')) {
-          sessionStorage.setItem('aurora_admin_token', ${JSON.stringify(localToken)});
-          location.reload();
-        }
-      `);
-    }
   } catch (e) {
     dialog.showErrorBox('연결 실패', e.message);
   }
@@ -168,23 +198,32 @@ if (!gotLock) {
   });
 
   // 콘솔 자동 시작 설정 (preload.js의 consoleApi를 통해 웹 UI에서 호출)
-  // 로그인 자동 시작 시에는 창 없이 트레이로 시작하도록 --minimized 인수를 함께 등록
-  const LOGIN_ITEM = { path: process.execPath, args: ['--minimized'] };
-
-  ipcMain.handle('get-console-prefs', () => {
-    const settings = app.getLoginItemSettings(LOGIN_ITEM);
-    return { openAtLogin: Boolean(settings.openAtLogin) };
+  ipcMain.handle('get-console-prefs', async () => {
+    if (!app.isPackaged) return { openAtLogin: false };
+    const r = await runAutostartTask('query');
+    return { openAtLogin: r.registered };
   });
 
-  ipcMain.handle('set-console-autostart', (_e, enable) => {
+  ipcMain.handle('set-console-autostart', async (_e, enable) => {
     if (!app.isPackaged) {
-      // 개발 모드(electron .)에서는 electron.exe가 등록되므로 실제 반영하지 않음
       return { ok: false, openAtLogin: false, message: '개발 모드에서는 자동 시작을 설정할 수 없습니다.' };
     }
-    app.setLoginItemSettings({ ...LOGIN_ITEM, openAtLogin: Boolean(enable) });
-    const applied = Boolean(app.getLoginItemSettings(LOGIN_ITEM).openAtLogin);
-    return { ok: applied === Boolean(enable), openAtLogin: applied };
+    const r = await runAutostartTask(enable ? 'register' : 'unregister');
+    const q = await runAutostartTask('query');
+    return { ok: r.ok && q.registered === Boolean(enable), openAtLogin: q.registered, message: r.message };
   });
+
+  // 이전 버전이 등록한 로그인 항목(HKCU Run)은 관리자 권한 앱이라 동작하지 않으므로 정리
+  if (app.isPackaged) {
+    try {
+      for (const args of [[], [STARTUP_ARG]]) {
+        const legacy = { path: process.execPath, args };
+        if (app.getLoginItemSettings(legacy).openAtLogin) {
+          app.setLoginItemSettings({ ...legacy, openAtLogin: false });
+        }
+      }
+    } catch (e) {}
+  }
 
   app.whenReady().then(() => {
     createTray();

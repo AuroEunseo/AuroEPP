@@ -31,6 +31,32 @@ if DATABASE_URL.startswith("sqlite"):
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+def secure_data_dir() -> None:
+    """패키징 실행(Windows) 시 데이터 폴더를 Administrators/SYSTEM 전용으로 제한
+
+    ProgramData 하위 폴더는 기본적으로 일반 사용자(Users)도 읽을 수 있어
+    계정 DB·업데이트 DB·백업 파일이 노출될 수 있으므로 상속을 끊고 권한을 재설정한다.
+    """
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    import subprocess
+
+    try:
+        subprocess.run(
+            [
+                "icacls", BASE_DIR, "/inheritance:r",
+                "/grant:r", "*S-1-5-32-544:(OI)(CI)F",   # BUILTIN\Administrators
+                "/grant:r", "*S-1-5-18:(OI)(CI)F",       # NT AUTHORITY\SYSTEM
+                "/T", "/C", "/Q",
+            ],
+            capture_output=True,
+            timeout=30,
+            creationflags=0x08000000,
+        )
+    except Exception:
+        pass
+
+
 def get_db():
     db = SessionLocal()
     try:

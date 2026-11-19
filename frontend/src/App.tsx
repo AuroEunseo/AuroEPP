@@ -11,8 +11,7 @@ import {
   XCircle,
   ShieldCheck,
   KeyRound,
-  Copy,
-  Check,
+  Bell,
   RefreshCw,
   Download,
   RotateCcw,
@@ -30,13 +29,21 @@ import {
   Power,
 } from 'lucide-react';
 import { DashboardState, Agent } from './types';
-import { apiFetch, getAdminToken, setAdminToken } from './api';
+import { apiFetch, clearSession, errorMessage, getSessionToken, getSessionUser } from './api';
 import { AgentDrawer } from './components/AgentDrawer';
+import { LoginScreen } from './components/LoginScreen';
+import { StartupLoading } from './components/StartupLoading';
+import { NotificationsPanel } from './components/NotificationsPanel';
+import { RejectedPcs } from './components/RejectedPcs';
+import { AccessLogPanel } from './components/AccessLogPanel';
+import { PasswordChangeForm } from './components/PasswordChangeForm';
 
 type MenuKey =
   | 'dashboard'
   | 'pcs-managed'
   | 'pcs-pending'
+  | 'pcs-rejected'
+  | 'notifications'
   | 'policy-registry'
   | 'policy-rules'
   | 'logs'
@@ -147,9 +154,10 @@ function formatLastSeen(ts: number): string {
 }
 
 export default function App() {
-  const [token, setTokenState] = useState(getAdminToken());
-  const [tokenInput, setTokenInput] = useState('');
-  const [copied, setCopied] = useState(false);
+  // 로그인 → 로딩(DB 백업/마이그레이션 진행 표시) → 준비 완료
+  const [phase, setPhase] = useState<'login' | 'loading' | 'ready'>(() => (getSessionToken() ? 'loading' : 'login'));
+  const [username, setUsername] = useState(getSessionUser());
+  const [forcePwChange, setForcePwChange] = useState(false);
   const [state, setState] = useState<DashboardState | null>(null);
 
   // 테마 상태
@@ -201,8 +209,25 @@ const showToast = (msg: string) => {
     localStorage.setItem('aurora_theme', theme);
   }, [theme]);
 
+  const goLogin = useCallback(() => {
+    clearSession();
+    setState(null);
+    setActiveAgent(null);
+    setForcePwChange(false);
+    setPhase('login');
+  }, []);
+
+  const logout = async () => {
+    try {
+      await apiFetch('/auth/logout', {});
+    } catch {
+      /* 세션이 이미 만료된 경우 무시 */
+    }
+    goLogin();
+  };
+
   const fetchState = useCallback(async () => {
-    if (!getAdminToken()) return;
+    if (!getSessionToken()) return;
     try {
       const data = await apiFetch<DashboardState>('/state');
       setState(data);
@@ -211,16 +236,23 @@ const showToast = (msg: string) => {
         prev ? data.agents.find((a) => a.machine_id === prev.machine_id) || null : null
       );
     } catch (e: any) {
-      if (e.message === 'UNAUTHORIZED') setTokenState('');
+      if (e.message === 'UNAUTHORIZED') goLogin();
+      else if (e.message === 'PASSWORD_CHANGE_REQUIRED') {
+        setForcePwChange(true);
+        setPhase('login');
+      } else if (e.message === 'NOT_READY') setPhase('loading');
     }
-  }, []);
+  }, [goLogin]);
 
   useEffect(() => {
+    if (phase !== 'ready') return;
     fetchState();
     const intervalMs = activeMenu === 'dashboard' ? 30000 : 10000;
     const id = setInterval(fetchState, intervalMs);
     return () => clearInterval(id);
-  }, [fetchState, token, activeMenu]);
+  }, [fetchState, phase, activeMenu]);
+
+  const onStartupReady = useCallback(() => setPhase('ready'), []);
 
   useEffect(() => {
     if (state && state.policies[ringTab] && loadedRing !== ringTab) {
@@ -230,7 +262,7 @@ const showToast = (msg: string) => {
   }, [state, ringTab, loadedRing]);
 
   const navigateToMenu = (menu: MenuKey) => {
-    if (menu === 'pcs-managed' || menu === 'pcs-pending') {
+    if (menu === 'pcs-managed' || menu === 'pcs-pending' || menu === 'pcs-rejected') {
       setPcMenuOpen(true);
     }
     if (menu === 'policy-registry' || menu === 'policy-rules') {
@@ -274,12 +306,6 @@ const showToast = (msg: string) => {
     }
   };
 
-  const copyToken = () => {
-    navigator.clipboard.writeText(token);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
   // Electron 콘솔(preload의 consoleApi)에서 실제 Windows 로그인 항목 상태를 읽어와 동기화
   useEffect(() => {
     const ipc = (window as any).consoleApi;
@@ -312,58 +338,37 @@ const showToast = (msg: string) => {
     }
   };
 
-  if (!token) {
+  if (phase === 'login') {
     return (
-      <div className="login-wrap">
-        <div className="glass-card login-card">
-          <div className="brand-group" style={{ marginBottom: 22 }}>
-            <div className="brand-logo mono">AU</div>
-            <div>
-              <h1 className="brand-title">AURORA Update Control</h1>
-              <p className="brand-sub">엔터프라이즈 패치 및 에이전트 중앙 관제</p>
-            </div>
-          </div>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              setAdminToken(tokenInput);
-              setTokenState(tokenInput);
-            }}
-            style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
-          >
-            <div>
-              <label style={{ display: 'block', fontSize: 12, marginBottom: 6 }}>
-                관리자 인증 토큰
-              </label>
-              <input
-                type="password"
-                value={tokenInput}
-                onChange={(e) => setTokenInput(e.target.value)}
-                placeholder="C:\ProgramData\AURORA\Server\admin_token.json"
-                className="input-dark mono"
-                style={{ width: '100%' }}
-                autoFocus
-              />
-            </div>
-            <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '10px' }}>
-              콘솔 접속하기
-            </button>
-          </form>
-        </div>
-      </div>
+      <LoginScreen
+        forcePasswordChange={forcePwChange}
+        usernameHint={username || undefined}
+        onLoggedIn={(u) => {
+          setUsername(u);
+          setForcePwChange(false);
+          setPhase('loading');
+        }}
+      />
     );
+  }
+
+  if (phase === 'loading') {
+    return <StartupLoading onReady={onStartupReady} onUnauthorized={goLogin} />;
   }
 
   if (!state) {
     return (
       <div className="login-wrap mono" style={{ color: 'var(--accent-text)', fontSize: 14 }}>
-        서버 상태 동기화 중...
+        PC 목록을 불러오는 중입니다...
       </div>
     );
   }
 
   const agents = state.agents;
   const pending = state.pending_agents || [];
+  const rejected = state.rejected_agents || [];
+  const notifCount = state.notification_count || 0;
+  const pendingAliveSec = state.limits?.pending_alive_sec ?? 45;
   const isOnline = (a: Agent) => state.now - a.last_seen < 60;
   const isApplied = (a: Agent) => a.applied_hash && a.applied_hash === a.target_hash;
   const compliancePct = agents.length
@@ -451,7 +456,12 @@ const showToast = (msg: string) => {
   };
 
   const handleDecision = async (machineId: string, approve: boolean, ring = 'ring1') => {
-    await apiFetch(`/agents/${machineId}/decision`, { approve, ring });
+    try {
+      await apiFetch(`/agents/${encodeURIComponent(machineId)}/decision`, { approve, ring });
+      showToast(approve ? '✓ 에이전트 응답을 확인하고 승인했습니다. 다음 통신부터 관리 대상으로 등록됩니다.' : '등록을 거부했습니다. (거부 PC 메뉴에서 해제 가능)');
+    } catch (e) {
+      alert(errorMessage(e));
+    }
     fetchState();
   };
 
@@ -477,16 +487,32 @@ const showToast = (msg: string) => {
   };
   const label = actionLabels[type] || type;
 
+  const offlineCount = agents.filter((a) => selectedIds.has(a.machine_id) && !isOnline(a)).length;
+  const offlineNote = offlineCount
+    ? `\n\n※ 오프라인 ${offlineCount}대는 대기열에 보관했다가 다음 부팅(재연결) 시 바로 적용됩니다.` +
+      (type === 'reboot' ? '\n   (재부팅은 그 사이 PC가 이미 켜졌다 꺼졌으므로 부팅 시 생략됩니다)' : '') +
+      (type === 'shutdown' ? '\n   (해당 PC는 켜지자마자 30초 후 종료됩니다)' : '')
+    : '';
   if (
     !window.confirm(
-      `선택한 ${selectedIds.size}대 PC (${previewNames})에 [${label}] 명령을 전송하시겠습니까?`
+      `선택한 ${selectedIds.size}대 PC (${previewNames})에 [${label}] 명령을 전송하시겠습니까?${offlineNote}`
     )
   ) {
     return;
   }
 
-  await apiFetch('/commands', { machine_ids: Array.from(selectedIds), type });
-  showToast(`✓ ${selectedIds.size}대 PC에 [${label}] 명령을 전송했습니다.`);
+  try {
+    const res = await apiFetch<{ dispatched: number; queued: string[]; duplicate: string[] }>('/commands', {
+      machine_ids: Array.from(selectedIds),
+      type,
+    });
+    const parts = [`즉시 ${res.dispatched}대`];
+    if (res.queued?.length) parts.push(`다음 부팅 시 적용 ${res.queued.length}대`);
+    if (res.duplicate?.length) parts.push(`이미 대기 중 ${res.duplicate.length}대`);
+    showToast(`✓ [${label}] 명령 전송: ${parts.join(' · ')}`);
+  } catch (e) {
+    alert(errorMessage(e));
+  }
   fetchState();
 };
 
@@ -504,7 +530,7 @@ const showToast = (msg: string) => {
     return ev.host.toLowerCase().includes(q) || ev.msg.toLowerCase().includes(q);
   });
 
-  const isPcMenuActive = activeMenu === 'pcs-managed' || activeMenu === 'pcs-pending';
+  const isPcMenuActive = activeMenu === 'pcs-managed' || activeMenu === 'pcs-pending' || activeMenu === 'pcs-rejected';
 
   return (
     <div className="app-layout">
@@ -597,6 +623,16 @@ const showToast = (msg: string) => {
                     </span>
                   )}
                 </button>
+                <button
+                  className={`nav-sub-item ${activeMenu === 'pcs-rejected' ? 'active' : ''}`}
+                  onClick={() => setActiveMenu('pcs-rejected')}
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                >
+                  <span>거부 PC</span>
+                  <span className="mono" style={{ fontSize: 11, opacity: 0.6 }}>
+                    {rejected.length}
+                  </span>
+                </button>
               </div>
             )}
           </div>
@@ -640,6 +676,17 @@ const showToast = (msg: string) => {
           </div>
 
           <button
+            className={`nav-item ${activeMenu === 'notifications' ? 'active' : ''}`}
+            onClick={() => navigateToMenu('notifications')}
+          >
+            <span className="nav-item-left">
+              <Bell size={16} />
+              <span>알림</span>
+            </span>
+            {notifCount > 0 && <span className="badge-count">{notifCount}</span>}
+          </button>
+
+          <button
             className={`nav-item ${activeMenu === 'logs' ? 'active' : ''}`}
             onClick={() => navigateToMenu('logs')}
           >
@@ -662,6 +709,9 @@ const showToast = (msg: string) => {
 
         <div className="sidebar-footer">
           <div style={{ color: '#10b981', fontWeight: 600 }}>● 관제 서버 정상 가동 중</div>
+          <div style={{ marginTop: 4, fontSize: 11 }}>
+            접속 계정: {username || '-'} · 포트 {state.server?.port ?? '-'}
+          </div>
           <div style={{ marginTop: 4, fontSize: 11 }}>
             테마: {THEMES.find((t) => t.key === theme)?.label}
           </div>
@@ -796,6 +846,8 @@ const showToast = (msg: string) => {
                             handleDecision(p.machine_id, true, sel.value);
                           }}
                           className="btn btn-approve"
+                          disabled={!p.alive}
+                          title={p.alive ? '' : '에이전트와 통신이 확인되어야 승인할 수 있습니다'}
                         >
                           <CheckCircle2 size={14} /> 승인
                         </button>
@@ -942,6 +994,20 @@ const showToast = (msg: string) => {
                           <div style={{ fontWeight: 700 }}>
                             <span className={`dot ${isOnline(a) ? 'dot-online' : 'dot-offline'}`} />
                             {a.hostname}
+                            {a.reconnect_waiting && (
+                              <span className="badge badge-warn" style={{ marginLeft: 6, fontSize: 10 }}>
+                                재부팅 후 재연결 확인 중
+                              </span>
+                            )}
+                            {!!a.queued_count && (
+                              <span
+                                className="badge badge-warn"
+                                style={{ marginLeft: 6, fontSize: 10 }}
+                                title="PC가 켜지면(재연결 시) 바로 적용됩니다"
+                              >
+                                대기 명령 {a.queued_count}건
+                              </span>
+                            )}
                           </div>
                           <div className="hw-spec-cell" style={{ paddingLeft: 15, marginTop: 4 }}>
                             <span className="mono" style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
@@ -1028,7 +1094,8 @@ const showToast = (msg: string) => {
               <div>
                 <h2 className="page-title">승인 대기 PC ({pending.length}대)</h2>
                 <p className="page-desc">
-                  에이전트가 설치되어 등록을 요청한 신규 PC 목록입니다. 인증 토큰을 확인하고 배포 그룹을 지정해 승인하세요.
+                  에이전트가 설치되어 등록을 요청한 신규 PC 목록입니다. 승인 시 해당 PC 에이전트와의 통신을 먼저 확인하며, 응답이
+                  확인된 PC만 등록됩니다.
                 </p>
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
@@ -1061,6 +1128,13 @@ const showToast = (msg: string) => {
                         </div>
                         <div className="mono" style={{ fontSize: 11.5, color: 'var(--accent-text)', marginTop: 4 }}>
                           인증 토큰: {p.token_preview}
+                        </div>
+                        <div style={{ marginTop: 6 }}>
+                          <span className={`badge ${p.alive ? 'badge-ok' : 'badge-warn'}`}>
+                            {p.alive
+                              ? `에이전트 응답 확인됨 (${Math.max(0, Math.round(state.now - p.last_seen))}초 전)`
+                              : `에이전트 응답 대기 중 (최근 ${pendingAliveSec}초 내 통신 없음)`}
+                          </span>
                         </div>
                       </div>
                       <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
@@ -1524,11 +1598,32 @@ const showToast = (msg: string) => {
                 )}
               </div>
             </section>
+
+            <AccessLogPanel />
           </>
         )}
 
+        {/* 알림 탭 */}
+        {activeMenu === 'notifications' && (
+          <NotificationsPanel
+            onChanged={fetchState}
+            onOpenPc={(mid) => {
+              const a = agents.find((x) => x.machine_id === mid);
+              if (a) setActiveAgent(a);
+              else if (pending.some((x) => x.machine_id === mid)) setActiveMenu('pcs-pending');
+              else if (rejected.some((x) => x.machine_id === mid)) setActiveMenu('pcs-rejected');
+              else showToast('해당 PC는 현재 관리 목록에 없습니다.');
+            }}
+          />
+        )}
+
+        {/* 거부 PC */}
+        {activeMenu === 'pcs-rejected' && (
+          <RejectedPcs rejected={rejected} onRefresh={fetchState} onToast={showToast} />
+        )}
+
         {/* ============================================================
-            5. 설정 탭 (관리자 토큰 관리 + Windows 시작 시 옵션 + 5종 테마)
+            5. 설정 탭 (관리자 계정/비밀번호 + Windows 시작 시 옵션 + 5종 테마)
            ============================================================ */}
         {activeMenu === 'settings' && (
           <>
@@ -1536,7 +1631,7 @@ const showToast = (msg: string) => {
               <div>
                 <h2 className="page-title">콘솔 환경 설정</h2>
                 <p className="page-desc">
-                  화면 색상 테마, 관리자 인증 토큰, Windows 시작 시 자동 실행 옵션을 관리합니다.
+                  화면 색상 테마, 관리자 비밀번호, Windows 시작 시 자동 실행 옵션을 관리합니다.
                 </p>
               </div>
             </div>
@@ -1576,35 +1671,18 @@ const showToast = (msg: string) => {
               <div className="panel-header">
                 <h3 className="panel-title">
                   <KeyRound size={16} style={{ color: 'var(--accent-text)' }} />
-                  <span>관리자 인증 토큰 관리</span>
+                  <span>관리자 계정 · 비밀번호 변경</span>
                 </h3>
+                <button onClick={logout} className="btn btn-rose">
+                  <LogOut size={14} /> 로그아웃
+                </button>
               </div>
               <p style={{ margin: '0 0 12px', fontSize: 12.5, color: 'var(--text-secondary)' }}>
-                외부 웹 브라우저에서 관제 서버(`http://서버IP:8080`)에 접속할 때 사용하는 마스터 관리자 토큰입니다.
+                현재 로그인 계정: <strong>{username || '-'}</strong> · 계정 정보는 서버 PC의 별도 계정 DB(aurora_accounts.db)에
+                암호화(해시)되어 저장됩니다. 비밀번호를 변경하면 다른 PC의 로그인 세션은 모두 종료됩니다.
               </p>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' }}>
-                <input
-                  type="text"
-                  readOnly
-                  value={token}
-                  className="input-dark mono"
-                  style={{ flex: 1, minWidth: 260 }}
-                />
-                <button onClick={copyToken} className="btn btn-primary">
-                  {copied ? <Check size={14} /> : <Copy size={14} />}
-                  <span>{copied ? '복사 완료' : '토큰 복사'}</span>
-                </button>
-                <button
-                  onClick={() => {
-                    if (confirm('현재 세션의 관리자 토큰을 해제하고 로그인 화면으로 이동할까요?')) {
-                      setAdminToken('');
-                      setTokenState('');
-                    }
-                  }}
-                  className="btn btn-rose"
-                >
-                  <LogOut size={14} /> 토큰 로그아웃
-                </button>
+              <div style={{ maxWidth: 360 }}>
+                <PasswordChangeForm onChanged={() => showToast('✓ 비밀번호가 변경되었습니다.')} />
               </div>
             </section>
 

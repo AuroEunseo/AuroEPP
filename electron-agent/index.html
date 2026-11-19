@@ -64,7 +64,7 @@
       </div>
       <div class="field port">
         <label>포트</label>
-        <input id="serverPort" type="number" placeholder="8080" />
+        <input id="serverPort" type="number" placeholder="1557" />
       </div>
     </div>
     <button class="btn" onclick="saveSettings()">저장 및 서버 재연결</button>
@@ -121,7 +121,7 @@
       document.getElementById('serverIp').value = s.config.server_ip || '127.0.0.1';
     }
     if (document.activeElement !== document.getElementById('serverPort')) {
-      document.getElementById('serverPort').value = s.config.server_port || 8080;
+      document.getElementById('serverPort').value = s.config.server_port || 1557;
     }
 
     document.getElementById('machineId').textContent = s.identity.machine_id || '서비스 시작 대기 중';

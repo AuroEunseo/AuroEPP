@@ -44,4 +44,23 @@ class CheckinRequest(BaseModel):
     agent_ver: str = "1.0"
     results: List[Dict[str, Any]] = Field(default_factory=list)
     updates: Optional[List[Dict[str, Any]]] = None
+    # 정기 보고: 설치/제거 이력 최근 30건
     history: Optional[List[Dict[str, Any]]] = None
+    # 상세 모달에서 요청한 전체 이력 (설치/제거, 최대 100건) → 서버 보관분을 교체
+    history_full: Optional[List[Dict[str, Any]]] = None
+    # 에이전트가 수행한 레지스트리 변경 기록 (변경 전/후 값)
+    reg_changes: List[Dict[str, Any]] = Field(default_factory=list)
+    # 재연결 확인용: PC 부팅 시각, 에이전트 서비스 시작 시각, 서비스 시작 후 첫 체크인 여부
+    boot_ts: Optional[float] = None
+    service_started_at: Optional[float] = None
+    first_checkin: bool = False
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str

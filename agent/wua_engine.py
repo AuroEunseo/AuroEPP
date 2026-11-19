@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import uuid
 
 IS_WIN = sys.platform == "win32"
 NOWIN = 0x08000000 if IS_WIN else 0
@@ -12,30 +14,106 @@ if IS_WIN:
     import winreg
 
 
-def apply_registry_item(item: dict) -> str | None:
-    path = item.get("path", "")
-    if not path.upper().startswith("SOFTWARE\\POLICIES\\"):
-        return f"허용되지 않은 레지스트리 경로: {path}"
+POLICY_ROOT = "SOFTWARE\\POLICIES\\"
+
+
+def _to_json_value(val):
+    if isinstance(val, (bytes, bytearray)):
+        return {"__hex__": bytes(val).hex()}
+    return val
+
+
+def _from_json_value(val):
+    if isinstance(val, dict) and "__hex__" in val:
+        return bytes.fromhex(val["__hex__"])
+    return val
+
+
+def read_registry_value(path: str, name: str):
+    """(존재 여부, winreg 타입 코드, 값) 반환"""
     if not IS_WIN:
-        return None
-
+        return False, None, None
     try:
-        acc = winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
-        if item.get("op") == "delete":
-            try:
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
-                    winreg.DeleteValue(k, item["name"])
-            except FileNotFoundError:
-                pass
-            return None
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            val, typ = winreg.QueryValueEx(k, name)
+            return True, typ, _to_json_value(val)
+    except OSError:
+        return False, None, None
 
-        is_dword = item.get("type") == "DWORD"
-        val = int(item["value"]) if is_dword else str(item["value"])
-        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
-            winreg.SetValueEx(k, item["name"], 0, winreg.REG_DWORD if is_dword else winreg.REG_SZ, val)
-        return None
+
+def _write_value(path: str, name: str, exists: bool, typ, value) -> None:
+    acc = winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
+    if not exists:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
+                winreg.DeleteValue(k, name)
+        except FileNotFoundError:
+            pass
+        return
+    with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0, acc) as k:
+        winreg.SetValueEx(k, name, 0, int(typ), _from_json_value(value))
+
+
+def _make_change(path, name, old, new, source, policy_hash="") -> dict:
+    return {
+        "cid": uuid.uuid4().hex,
+        "ts": time.time(),
+        "source": source,
+        "policy_hash": policy_hash,
+        "path": path,
+        "name": name,
+        "op": "set" if new[0] else "delete",
+        "old_exists": old[0], "old_type": old[1], "old_value": old[2],
+        "new_exists": new[0], "new_type": new[1], "new_value": new[2],
+    }
+
+
+def apply_registry_item(item: dict, policy_hash: str = ""):
+    """정책 항목 1건 적용. (오류 메시지 또는 None, 변경 기록 또는 None) 반환
+
+    값이 실제로 바뀐 경우에만 변경 전/후 값을 기록해 롤백할 수 있게 한다.
+    """
+    path = item.get("path", "")
+    if not path.upper().startswith(POLICY_ROOT):
+        return f"허용되지 않은 레지스트리 경로: {path}", None
+    if not IS_WIN:
+        return None, None
+
+    name = item.get("name", "")
+    try:
+        old = read_registry_value(path, name)
+        if item.get("op") == "delete":
+            new = (False, None, None)
+        else:
+            is_dword = item.get("type") == "DWORD"
+            new = (
+                True,
+                winreg.REG_DWORD if is_dword else winreg.REG_SZ,
+                int(item["value"]) if is_dword else str(item["value"]),
+            )
+        if old == new or (not old[0] and not new[0]):
+            return None, None
+        _write_value(path, name, *new)
+        return None, _make_change(path, name, old, new, "policy", policy_hash)
     except Exception as e:
-        return f"{path}\\{item.get('name')}: {e}"
+        return f"{path}\\{name}: {e}", None
+
+
+def restore_registry_value(path: str, name: str, exists: bool, typ, value):
+    """롤백: 변경 전 값으로 되돌린다. (오류 메시지 또는 None, 변경 기록 또는 None)"""
+    if not str(path).upper().startswith(POLICY_ROOT):
+        return f"허용되지 않은 레지스트리 경로: {path}", None
+    if not IS_WIN:
+        return None, None
+    try:
+        old = read_registry_value(path, name)
+        new = (bool(exists), typ if exists else None, value if exists else None)
+        if exists and typ is None:
+            return "복원할 값의 형식 정보가 없습니다.", None
+        _write_value(path, name, *new)
+        return None, _make_change(path, name, old, new, "rollback")
+    except Exception as e:
+        return f"{path}\\{name}: {e}", None
 
 
 def is_reboot_pending() -> bool:

@@ -1,7 +1,7 @@
 {
   "name": "aurora-agent",
-  "version": "1.0.2",
-  "description": "AURORA Update Control Endpoint Agent",
+  "version": "1.0.3",
+  "description": "AURORA Endpoint Agent",
   "main": "main.js",
   "scripts": {
     "build:win": "electron-builder --win nsis"
@@ -18,7 +18,7 @@
       "package.json"
     ],
     "appId": "com.aurora.control.agent",
-    "productName": "AURORA Update Agent",
+    "productName": "AURORA Endpoit Agent",
     "directories": {
       "output": "../dist-installers"
     },

@@ -756,3 +756,16 @@ body {
   max-width: 420px;
   padding: 32px;
 }
+/* 로딩 아이콘 회전 (StartupLoading) */
+.spin {
+  animation: aurora-spin 1s linear infinite;
+}
+@keyframes aurora-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

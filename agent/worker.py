@@ -2,6 +2,7 @@ import json
 import queue
 import socket
 import ctypes
+import sys
 import platform
 import uuid
 import winreg
@@ -11,12 +12,16 @@ import time
 import urllib.error
 import urllib.request
 
-from config import load_server_url
+import os
+
+from agent_log import get_logger
+from config import DATA_DIR, load_server_url
 from identity import wait_for_approval, get_os_info, get_or_create_identity
 from wua_engine import (
     NOWIN,
     apply_registry_item,
     is_reboot_pending,
+    restore_registry_value,
     scan_updates,
     enforce_updates,
 )
@@ -24,6 +29,33 @@ from wua_engine import (
 AGENT_VER = "1.0.2"
 CHECKIN_INTERVAL = 20
 AUTO_SCAN_INTERVAL = 300
+
+REPORT_HISTORY_MAX = 30       # 정기 보고 시 전송하는 설치/제거 이력 건수
+FULL_HISTORY_MAX = 100        # 상세 모달 요청 시 전송하는 전체 이력 최대 건수
+REG_HISTORY_FILE = os.path.join(DATA_DIR, "registry_history.json")
+REG_HISTORY_KEEP = 200
+
+log = get_logger()
+
+
+def get_boot_ts() -> float | None:
+    """PC 마지막 부팅 시각(epoch). 서버가 '부팅 후 재연결'과 대기 중 재부팅 명령 생략 여부를 판단하는 데 사용"""
+    try:
+        if sys.platform == "win32":
+            ms = ctypes.windll.kernel32.GetTickCount64
+            ms.restype = ctypes.c_ulonglong
+            return round(time.time() - ms() / 1000.0, -1)  # 10초 단위로 맞춰 매 보고마다 흔들리지 않게
+        with open("/proc/uptime") as f:
+            return round(time.time() - float(f.read().split()[0]), -1)
+    except Exception:
+        return None
+
+
+def _install_uninstall_only(hist: list[dict], limit: int) -> list[dict]:
+    """Windows Update 이력 중 설치(op=1)/제거(op=2)만 최신순으로 limit 건"""
+    rows = [h for h in hist if h.get("op") in (1, 2)]
+    rows.sort(key=lambda h: h.get("date") or "", reverse=True)
+    return rows[:limit]
 
 
 class AgentWorker:
@@ -39,6 +71,52 @@ class AgentWorker:
         # SSE 푸시 수신 시 체크인 대기를 즉시 깨우기 위한 이벤트
         self.wake_event = threading.Event()
         self.approved = False
+        self.service_started_at = time.time()
+        self.first_checkin = True
+        # 서버 전송 대기 중인 레지스트리 변경 기록 (전송 성공 시에만 비움)
+        self.pending_reg_changes: list[dict] = self._load_unsent_reg_changes()
+
+    # ------------------------------------------------------------------
+    # 레지스트리 변경 이력 (로컬 보관 + 서버 보고)
+    # ------------------------------------------------------------------
+    def _load_unsent_reg_changes(self) -> list[dict]:
+        try:
+            with open(REG_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return [c for c in json.load(f) if not c.get("sent")]
+        except (OSError, ValueError):
+            return []
+
+    def _record_reg_changes(self, changes: list[dict]):
+        if not changes:
+            return
+        with self.lock:
+            self.pending_reg_changes.extend(changes)
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            try:
+                with open(REG_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    hist = json.load(f)
+            except (OSError, ValueError):
+                hist = []
+            hist.extend(changes)
+            with open(REG_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(hist[-REG_HISTORY_KEEP:], f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    def _mark_reg_changes_sent(self, cids: set[str]):
+        if not cids:
+            return
+        try:
+            with open(REG_HISTORY_FILE, "r", encoding="utf-8") as f:
+                hist = json.load(f)
+            for c in hist:
+                if c.get("cid") in cids:
+                    c["sent"] = True
+            with open(REG_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(hist[-REG_HISTORY_KEEP:], f, ensure_ascii=False, indent=1)
+        except (OSError, ValueError):
+            pass
 
     def _bg_worker(self):
         while not self.stop_event.is_set():
@@ -58,23 +136,31 @@ class AgentWorker:
                     merged_map[r["kb"]] = r["action"]
                 merged_rules = [{"kb": k, "action": v} for k, v in merged_map.items()]
 
-                if merged_rules or kind == "install_all":
+                if kind != "history_full" and (merged_rules or kind == "install_all"):
                     msgs = enforce_updates(merged_rules, install_all=(kind == "install_all"))
 
                 scan_data = scan_updates()
+                all_hist = scan_data.get("hist", [])
                 done_kbs = [
                     h["kb"]
-                    for h in scan_data.get("hist", [])
+                    for h in all_hist
                     if h.get("op") == 1 and h.get("rc") in (2, 3) and h.get("kb")
                 ]
                 hotfix_str = ",".join(dict.fromkeys(done_kbs))
 
+                report = {
+                    "updates": scan_data.get("pend", []),
+                    "history": _install_uninstall_only(all_hist, REPORT_HISTORY_MAX),
+                    "hotfix": hotfix_str,
+                }
+                if kind == "history_full":
+                    report["history_full"] = _install_uninstall_only(all_hist, FULL_HISTORY_MAX)
+
                 with self.lock:
-                    self.pending_report = {
-                        "updates": scan_data.get("pend", []),
-                        "history": scan_data.get("hist", []),
-                        "hotfix": hotfix_str,
-                    }
+                    # 아직 전송되지 않은 전체 이력 요청 결과는 덮어쓰지 않고 유지
+                    if self.pending_report and "history_full" in self.pending_report and "history_full" not in report:
+                        report["history_full"] = self.pending_report["history_full"]
+                    self.pending_report = report
                     for m in msgs:
                         self.cmd_results.append({"type": "update", "ok": True, "out": m})
             except Exception as e:
@@ -155,9 +241,18 @@ class AgentWorker:
                 break
         self.wake_event.clear()
 
+    def _restore_unsent(self, report_payload, results_payload):
+        """체크인 실패 시 보고 내용/명령 결과를 다음 체크인에서 다시 보내도록 되돌림"""
+        with self.lock:
+            if report_payload and not self.pending_report:
+                self.pending_report = report_payload
+            if results_payload:
+                self.cmd_results[:0] = results_payload[-50:]
+
     def _run_command(self, cmd: dict):
         ctype = cmd.get("type")
         cpayload = cmd.get("payload") or {}
+        log.info("명령 수신: %s %s", ctype, cpayload.get("kb", "") if isinstance(cpayload, dict) else "")
         kb = cpayload.get("kb", "")
 
         if ctype == "scan":
@@ -170,6 +265,26 @@ class AgentWorker:
             self._enqueue_job("single_kb", [{"kb": kb, "action": "block"}])
         elif ctype == "unhide_kb" and kb:
             self._enqueue_job("single_kb", [{"kb": kb, "action": "allow"}])
+        elif ctype == "report_history":
+            self._enqueue_job("history_full")
+        elif ctype == "reg_rollback":
+            err, change = restore_registry_value(
+                cpayload.get("path", ""),
+                cpayload.get("name", ""),
+                bool(cpayload.get("restore_exists")),
+                cpayload.get("restore_type"),
+                cpayload.get("restore_value"),
+            )
+            if change:
+                self._record_reg_changes([change])
+            target = f"{cpayload.get('path', '')}\\{cpayload.get('name', '')}"
+            with self.lock:
+                self.cmd_results.append({
+                    "type": "reg_rollback",
+                    "ok": not err,
+                    "ref": cpayload.get("ref"),
+                    "out": err or f"{target} 변경 전 값으로 복원 완료",
+                })
         elif ctype in ("reboot", "shutdown"):
             flag, verb, label = (
                 ("/r", "Rebooting", "Reboot") if ctype == "reboot" else ("/s", "Shutting down", "Shutdown")
@@ -192,12 +307,16 @@ class AgentWorker:
     def run(self):
         threading.Thread(target=self._bg_worker, daemon=True).start()
         hw_specs = self.get_hardware_specs()
+        log.info("에이전트 시작 (버전 %s, 서버 %s, 부팅 시각 %s)", AGENT_VER, load_server_url(),
+                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(get_boot_ts() or 0)))
 
         while not self.stop_event.is_set():
             # Step 1: Wait for admin approval in console
             self.approved = False
-            ident = wait_for_approval(self.server_url, AGENT_VER, self.stop_event, wait_fn=self._wait)
+            ident = wait_for_approval(load_server_url, AGENT_VER, self.stop_event, wait_fn=self._wait)
             self.approved = True
+            log.info("승인 확인 → 체크인 시작")
+            fail_count = 0
 
             applied_hash = ""
             seen_rules_hash = None
@@ -217,9 +336,13 @@ class AgentWorker:
                         results_payload = list(self.cmd_results)
                         self.cmd_results.clear()
 
+                    reg_payload = list(self.pending_reg_changes)
+
                 if report_payload:
                     hotfix = report_payload["hotfix"]
 
+                # 서버 주소는 매 체크인마다 agent_config.json(단일 설정 지점)에서 다시 읽는다
+                self.server_url = load_server_url()
                 os_name, os_build = get_os_info()
                 body = {
                     "hostname": socket.gethostname(),
@@ -233,10 +356,17 @@ class AgentWorker:
                     "hotfix": hotfix,
                     "agent_ver": AGENT_VER,
                     "results": results_payload,
+                    "boot_ts": get_boot_ts(),
+                    "service_started_at": self.service_started_at,
+                    "first_checkin": self.first_checkin,
                 }
                 if report_payload:
                     body["updates"] = report_payload["updates"]
                     body["history"] = report_payload["history"]
+                    if "history_full" in report_payload:
+                        body["history_full"] = report_payload["history_full"]
+                if reg_payload:
+                    body["reg_changes"] = reg_payload
 
                 try:
                     req = urllib.request.Request(
@@ -250,12 +380,30 @@ class AgentWorker:
                     )
                     with urllib.request.urlopen(req, timeout=15) as resp:
                         res = json.loads(resp.read().decode("utf-8"))
+                    if self.first_checkin or fail_count:
+                        log.info("체크인 성공%s (대기 명령 %d건 수신)",
+                                 f" (실패 {fail_count}회 후 복구)" if fail_count else " (서비스 시작 후 첫 연결)",
+                                 len(res.get("commands", [])))
+                    self.first_checkin = False
+                    fail_count = 0
 
                     self.global_rules = res.get("rules", [])
+
+                    # 전송 성공한 레지스트리 변경 기록은 대기 목록에서 제거
+                    if reg_payload:
+                        sent = {c["cid"] for c in reg_payload}
+                        with self.lock:
+                            self.pending_reg_changes = [
+                                c for c in self.pending_reg_changes if c["cid"] not in sent
+                            ]
+                        self._mark_reg_changes_sent(sent)
 
                     # Process server commands
                     for cmd in res.get("commands", []):
                         self._run_command(cmd)
+                    # 즉시 실행된 명령(롤백·재부팅 등)의 결과를 다음 주기까지 기다리지 않고 바로 보고
+                    if res.get("commands"):
+                        self.wake_event.set()
 
                     # Sync update list on rule change or periodic interval
                     if res.get("rules_hash") != seen_rules_hash or (time.time() - last_scan_ts > AUTO_SCAN_INTERVAL):
@@ -266,7 +414,14 @@ class AgentWorker:
                     # Apply registry policy
                     pol = res.get("policy", {})
                     if pol.get("hash") and pol["hash"] != applied_hash:
-                        errs = [e for e in map(apply_registry_item, pol.get("items", [])) if e]
+                        errs, changes = [], []
+                        for item in pol.get("items", []):
+                            err, change = apply_registry_item(item, pol["hash"])
+                            if err:
+                                errs.append(err)
+                            if change:
+                                changes.append(change)
+                        self._record_reg_changes(changes)
                         with self.lock:
                             self.cmd_results.append({
                                 "type": "policy",
@@ -278,10 +433,24 @@ class AgentWorker:
                             continue
 
                 except urllib.error.HTTPError as e:
-                    if e.code in (401, 403, 404):
+                    self._restore_unsent(report_payload, results_payload)
+                    # 토큰을 새로 만드는 것은 서버가 '토큰 불일치(401)'를 알린 경우뿐.
+                    # 404(서버 기록 없음)·403(승인 대기/거부)은 기존 토큰으로 재등록 → 토큰을 잃고 재승인이 필요해지는 일을 방지
+                    if e.code == 401:
+                        log.warning("체크인 401: 토큰 불일치(폐기됨) → 새 토큰으로 재등록")
                         get_or_create_identity(force_new_token=True)
                         break
-                except Exception:
-                    pass
+                    if e.code in (403, 404):
+                        log.warning("체크인 %s: %s → 기존 토큰으로 재등록 대기", e.code,
+                                    "승인 대기/거부 상태" if e.code == 403 else "서버에 PC 기록 없음")
+                        break
+                    fail_count += 1
+                    log.warning("체크인 실패: HTTP %s (%d회째)", e.code, fail_count)
+                except Exception as e:
+                    self._restore_unsent(report_payload, results_payload)
+                    fail_count += 1
+                    if fail_count in (1, 3) or fail_count % 30 == 0:
+                        log.warning("체크인 실패: %s (%d회째)", e, fail_count)
 
-                self._wait(CHECKIN_INTERVAL)
+                # 연결 실패 시에는 짧게(3→6→12초) 재시도해 부팅·네트워크 복구 직후 빠르게 재연결
+                self._wait(min(3 * (2 ** (fail_count - 1)), CHECKIN_INTERVAL) if fail_count else CHECKIN_INTERVAL)

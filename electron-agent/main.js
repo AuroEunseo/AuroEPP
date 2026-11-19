@@ -1,5 +1,5 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog } = require('electron');
-const { exec } = require('child_process');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell } = require('electron');
+const { exec, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -7,9 +7,15 @@ const https = require('https');
 
 const DATA_DIR = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA');
 const IDENTITY_FILE = path.join(DATA_DIR, 'identity.json');
+// 관제 서버 주소의 단일 설정 지점 (서비스·워커·트레이 모두 이 파일만 사용)
 const CONFIG_FILE = path.join(DATA_DIR, 'agent_config.json');
+// 서비스가 남기는 연결 진단 로그 (부팅 후 재연결 실패 시 원인 확인용)
+const AGENT_LOG_FILE = path.join(DATA_DIR, 'logs', 'agent.log');
+const DEFAULT_SERVER_IP = '127.0.0.1';
+const DEFAULT_SERVER_PORT = 1557;
+const AUTOSTART_TASK = 'AURORA Update Agent Tray';
 
-// 로그인 자동 실행 인수: --minimized (설치 파일 installer.nsh의 Run 레지스트리와 동일)
+// 로그인 자동 실행 인수: --minimized (작업 스케줄러 자동 시작 작업과 동일)
 // --tray / --hidden 은 이전 버전 설치본 호환용으로만 인식
 const STARTUP_ARG = '--minimized';
 const START_MINIMIZED = [STARTUP_ARG, '--tray', '--hidden'].some((a) => process.argv.includes(a));
@@ -37,15 +43,72 @@ function readJsonSafe(filePath, fallback) {
   return fallback;
 }
 
-// 사용자가 'http://192.168.0.10:8080' 형태로 입력해도 순수 호스트명만 추출
+// 사용자가 'http://192.168.0.10:1557' 형태로 입력해도 순수 호스트명만 추출
 function normalizeHost(rawIp) {
   return (
     String(rawIp || '')
       .trim()
       .replace(/^https?:\/\//i, '')
       .replace(/\/.*$/, '')
-      .replace(/:\d+$/, '') || '127.0.0.1'
+      .replace(/:\d+$/, '') || DEFAULT_SERVER_IP
   );
+}
+
+function readServerConfig() {
+  const cfg = readJsonSafe(CONFIG_FILE, {});
+  let ip = cfg.server_ip;
+  let port = cfg.server_port;
+  if (!ip && cfg.server_url) {
+    // 이전 버전 설정 파일 호환
+    const m = String(cfg.server_url).match(/^(?:https?:\/\/)?([^/:]+)(?::(\d+))?/i);
+    if (m) {
+      ip = m[1];
+      port = m[2];
+    }
+  }
+  return {
+    server_ip: normalizeHost(ip || DEFAULT_SERVER_IP),
+    server_port: parseInt(port, 10) || DEFAULT_SERVER_PORT,
+  };
+}
+
+function writeServerConfig(ip, port) {
+  ensureDataDir();
+  const payload = {
+    server_ip: normalizeHost(ip),
+    server_port: parseInt(port, 10) || DEFAULT_SERVER_PORT,
+  };
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(payload, null, 2), 'utf8');
+  return payload;
+}
+
+function getAutostartScriptPath() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'tasks', 'aurora-autostart.ps1')
+    : path.join(__dirname, 'resources', 'tasks', 'aurora-autostart.ps1');
+}
+
+// 작업 스케줄러 자동 시작 작업 등록/해제/조회 (관리자 권한 앱은 Run 레지스트리로 자동 실행되지 않음)
+function runAutostartTask(action) {
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', getAutostartScriptPath(),
+        '-Action', action,
+        '-TaskName', AUTOSTART_TASK,
+        '-Exe', process.execPath,
+        '-Arguments', STARTUP_ARG,
+        '-Scope', 'AllUsers',
+      ],
+      { windowsHide: true },
+      (err, stdout) => {
+        const out = String(stdout || '').trim();
+        resolve({ ok: !err && !out.startsWith('ERROR'), registered: out.includes('REGISTERED') && !out.includes('NOT_'), message: out });
+      }
+    );
+  });
 }
 
 function getEngineExePath() {
@@ -68,12 +131,12 @@ function checkServiceStatus() {
 function pingServer(ip, port) {
   return new Promise((resolve) => {
     const cleanHost = normalizeHost(ip);
-    const cleanPort = parseInt(port, 10) || 8080;
+    const cleanPort = parseInt(port, 10) || DEFAULT_SERVER_PORT;
     const req = http.get(
-      { hostname: cleanHost, port: cleanPort, path: '/api/state', timeout: 2000 },
+      { hostname: cleanHost, port: cleanPort, path: '/api/health', timeout: 2000 },
       (res) => {
         res.resume();
-        resolve(res.statusCode === 200 || res.statusCode === 401 || res.statusCode === 403);
+        resolve(res.statusCode === 200);
       }
     );
     req.on('error', () => resolve(false));
@@ -88,25 +151,25 @@ function pingServer(ip, port) {
 function ensureBootPersistenceAndReconnect() {
   ensureDataDir();
 
-  // 1. 마지막 연결 서버 설정(agent_config.json) 보존 (없을 때만 기본값 생성)
-  if (!fs.existsSync(CONFIG_FILE)) {
-    const defaultCfg = {
-      server_ip: '127.0.0.1',
-      server_port: 8080,
-      server_url: 'http://127.0.0.1:8080',
-    };
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaultCfg, null, 2), 'utf8');
-  }
+  // 1. 마지막 연결 서버 설정(agent_config.json) 보존 (없으면 기본값, 이전 형식이면 새 형식으로 정리)
+  const cfg = readServerConfig();
+  writeServerConfig(cfg.server_ip, cfg.server_port);
 
-  // 2. 로그인 자동 실행은 설치 파일이 HKLM Run(모든 사용자, --minimized)으로 등록한다.
-  //    이전 버전이 사용자별(HKCU)로 중복 등록한 항목은 정리하여 트레이가 두 번 뜨지 않도록 한다.
+  // 2. 로그인 자동 실행: 작업 스케줄러(가장 높은 권한, 모든 사용자 로그온, --minimized)
+  //    설치 파일이 등록하지만, 누락된 경우를 대비해 실행 시마다 확인 후 재등록한다.
+  //    이전 버전이 등록한 HKCU 로그인 항목은 중복 실행 방지를 위해 정리한다.
   if (app.isPackaged) {
     try {
-      const legacy = { path: process.execPath, args: [STARTUP_ARG] };
-      if (app.getLoginItemSettings(legacy).openAtLogin) {
-        app.setLoginItemSettings({ ...legacy, openAtLogin: false });
+      for (const args of [[STARTUP_ARG], ['--tray']]) {
+        const legacy = { path: process.execPath, args };
+        if (app.getLoginItemSettings(legacy).openAtLogin) {
+          app.setLoginItemSettings({ ...legacy, openAtLogin: false });
+        }
       }
     } catch (e) {}
+    runAutostartTask('query').then((r) => {
+      if (!r.registered) runAutostartTask('register');
+    });
   }
 
   // 3. Windows 부팅 시 백그라운드 서비스 자동 시작 및 실패 시 자동 재시작 설정 + 즉시 기동
@@ -167,13 +230,11 @@ function restartAgentService() {
 function sendShutdownLogToServer() {
   return new Promise((resolve) => {
     const identity = readJsonSafe(IDENTITY_FILE, {});
-    const config = readJsonSafe(CONFIG_FILE, { server_ip: '127.0.0.1', server_port: 8080 });
+    const config = readServerConfig();
 
     if (!identity.machine_id || !identity.agent_token) return resolve();
 
-    const baseUrl =
-      config.server_url ||
-      `http://${normalizeHost(config.server_ip)}:${config.server_port || 8080}`;
+    const baseUrl = `http://${config.server_ip}:${config.server_port}`;
     const targetUrl = new URL('/api/agent/shutdown', baseUrl);
     const body = JSON.stringify({
       machine_id: identity.machine_id,
@@ -235,25 +296,14 @@ function showStatusWindow() {
 
 ipcMain.handle('get-state', async () => {
   const identity = readJsonSafe(IDENTITY_FILE, { machine_id: '', agent_token: '' });
-  const config = readJsonSafe(CONFIG_FILE, { server_ip: '127.0.0.1', server_port: 8080 });
+  const config = readServerConfig();
   const serviceStatus = await checkServiceStatus();
-  const serverReachable = await pingServer(
-    config.server_ip || '127.0.0.1',
-    config.server_port || 8080
-  );
+  const serverReachable = await pingServer(config.server_ip, config.server_port);
   return { identity, config, serviceStatus, serverReachable };
 });
 
 ipcMain.handle('save-config', async (_event, { ip, port }) => {
-  ensureDataDir();
-  const cleanIp = normalizeHost(ip);
-  const cleanPort = parseInt(port, 10) || 8080;
-  const payload = {
-    server_ip: cleanIp,
-    server_port: cleanPort,
-    server_url: `http://${cleanIp}:${cleanPort}`,
-  };
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(payload, null, 2), 'utf8');
+  writeServerConfig(ip, port);
   return await restartAgentService();
 });
 
@@ -276,6 +326,13 @@ function createTray() {
     {
       label: '백그라운드 서비스 재시작 (서버 재연결)',
       click: () => restartAgentService(),
+    },
+    {
+      label: '연결 진단 로그 열기',
+      click: () => {
+        if (fs.existsSync(AGENT_LOG_FILE)) shell.openPath(AGENT_LOG_FILE);
+        else dialog.showMessageBox({ type: 'info', message: '아직 기록된 로그가 없습니다.', detail: AGENT_LOG_FILE });
+      },
     },
     { type: 'separator' },
     {
