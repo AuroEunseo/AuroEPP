@@ -195,8 +195,20 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
 
         {/* 개별 PC 제어 및 삭제 버튼 */}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          <button onClick={() => sendCmd('scan')} className="btn btn-ghost">
-            <RefreshCw size={13} style={{ color: 'var(--accent-text)' }} /> 즉시 스캔
+          <button
+            onClick={async () => {
+              try {
+                const r = await apiFetch<{ sent: number }>('/scan', { machine_ids: [agent.machine_id] });
+                alert(r.sent ? '업데이트 검색을 요청했습니다. 결과는 검색이 끝나는 대로 자동 반영됩니다.' : 'PC가 오프라인이라 검색할 수 없습니다.');
+              } catch (e) {
+                alert(errorMessage(e));
+              }
+            }}
+            className="btn btn-ghost"
+            disabled={!online}
+            title="Windows 업데이트 목록만 다시 검색합니다 (설치하지 않음)"
+          >
+            <RefreshCw size={13} style={{ color: 'var(--accent-text)' }} /> 업데이트 다시 검색
           </button>
           <button onClick={() => sendCmd('install_all')} className="btn btn-emerald">
             <Download size={13} /> 대기 전체 설치

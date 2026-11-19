@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
   LayoutDashboard,
   Monitor,
@@ -28,7 +28,7 @@ import {
   ArrowUpRight,
   Power,
 } from 'lucide-react';
-import { DashboardState, Agent } from './types';
+import { DashboardState, Agent, Presence } from './types';
 import { apiFetch, clearSession, errorMessage, getSessionToken, getSessionUser } from './api';
 import { AgentDrawer } from './components/AgentDrawer';
 import { LoginScreen } from './components/LoginScreen';
@@ -37,6 +37,7 @@ import { NotificationsPanel } from './components/NotificationsPanel';
 import { RejectedPcs } from './components/RejectedPcs';
 import { AccessLogPanel } from './components/AccessLogPanel';
 import { PasswordChangeForm } from './components/PasswordChangeForm';
+import { AccountManager } from './components/AccountManager';
 import logoUrl from './assets/ac1.png';
 
 type MenuKey =
@@ -158,6 +159,10 @@ export default function App() {
   // 로그인 → 로딩(DB 백업/마이그레이션 진행 표시) → 준비 완료
   const [phase, setPhase] = useState<'login' | 'loading' | 'ready'>(() => (getSessionToken() ? 'loading' : 'login'));
   const [username, setUsername] = useState(getSessionUser());
+  const [role, setRole] = useState<'admin' | 'operator' | ''>('');
+  const [scanBusy, setScanBusy] = useState(false);
+  const lastRevRef = useRef('');
+  const lastFullFetchRef = useRef(0);
   const [forcePwChange, setForcePwChange] = useState(false);
   const [state, setState] = useState<DashboardState | null>(null);
 
@@ -245,13 +250,81 @@ const showToast = (msg: string) => {
     }
   }, [goLogin]);
 
+  // 상태 갱신 방식
+  //  - 10초마다 /presence (가벼운 응답): PC 온라인/오프라인 표시와 알림 수만 갱신
+  //  - 서버 데이터가 바뀌었을 때(rev 변경) 또는 5분이 지났을 때만 전체 상태(/state)를 다시 받음
+  //  - 사용자가 명령·설정을 바꾸면 각 동작에서 fetchState()로 즉시 갱신
+  const FULL_REFRESH_MS = 5 * 60 * 1000;
+  const pollPresence = useCallback(async () => {
+    if (!getSessionToken()) return;
+    try {
+      const p = await apiFetch<Presence>('/presence');
+      const stale = Date.now() - lastFullFetchRef.current > FULL_REFRESH_MS;
+      if (p.rev !== lastRevRef.current || stale) {
+        lastRevRef.current = p.rev;
+        lastFullFetchRef.current = Date.now();
+        await fetchState();
+        return;
+      }
+      const applyPresence = (a: Agent): Agent => {
+        const ls = p.last_seen[a.machine_id];
+        return ls === undefined ? a : { ...a, last_seen: ls, online: p.now - ls < p.online_sec };
+      };
+      setState((prev) =>
+        prev
+          ? {
+              ...prev,
+              now: p.now,
+              notification_count: p.notification_count,
+              agents: prev.agents.map(applyPresence),
+              pending_agents: prev.pending_agents.map((a) => ({ ...applyPresence(a), alive: p.now - (p.last_seen[a.machine_id] ?? 0) < (prev.limits?.pending_alive_sec ?? 45) })),
+              rejected_agents: prev.rejected_agents.map((a) => ({ ...applyPresence(a), alive: p.now - (p.last_seen[a.machine_id] ?? 0) < (prev.limits?.pending_alive_sec ?? 45) })),
+            }
+          : prev
+      );
+      setActiveAgent((prev) => (prev ? applyPresence(prev) : prev));
+    } catch (e: any) {
+      if (e.message === 'UNAUTHORIZED') goLogin();
+      else if (e.message === 'PASSWORD_CHANGE_REQUIRED') {
+        setForcePwChange(true);
+        setPhase('login');
+      } else if (e.message === 'NOT_READY') setPhase('loading');
+    }
+  }, [fetchState, goLogin]);
+
   useEffect(() => {
     if (phase !== 'ready') return;
-    fetchState();
-    const intervalMs = activeMenu === 'dashboard' ? 30000 : 10000;
-    const id = setInterval(fetchState, intervalMs);
+    lastRevRef.current = '';
+    pollPresence();
+    const id = setInterval(pollPresence, 10000);
     return () => clearInterval(id);
-  }, [fetchState, phase, activeMenu]);
+  }, [pollPresence, phase]);
+
+  // 로그인 계정의 권한 (관리자만 계정 관리 메뉴 표시)
+  useEffect(() => {
+    if (phase !== 'ready') return;
+    apiFetch<{ role: 'admin' | 'operator' }>('/auth/me')
+      .then((m) => setRole(m.role))
+      .catch(() => setRole(''));
+  }, [phase, username]);
+
+  // [업데이트 다시 검색]: 업데이트 검색만 요청 (설치·규칙 적용 없음). 선택한 PC가 없으면 온라인 PC 전체
+  const requestScan = async () => {
+    const ids = Array.from(selectedIds);
+    setScanBusy(true);
+    try {
+      const res = await apiFetch<{ sent: number; skipped: string[] }>('/scan', { machine_ids: ids });
+      showToast(
+        `✓ ${ids.length ? '선택한' : '온라인'} PC ${res.sent}대에 업데이트 검색을 요청했습니다.` +
+          (res.skipped.length ? ` (오프라인 ${res.skipped.length}대 제외)` : '') +
+          ' 결과는 검색이 끝나는 대로 자동 반영됩니다.'
+      );
+    } catch (e) {
+      alert(errorMessage(e));
+    } finally {
+      setScanBusy(false);
+    }
+  };
 
   const onStartupReady = useCallback(() => setPhase('ready'), []);
 
@@ -730,7 +803,7 @@ const showToast = (msg: string) => {
               <div>
                 <h2 className="page-title">관제 요약 대시보드</h2>
                 <p className="page-desc">
-                  전체 엔드포인트 현황 요약 및 실시간 감사 로그 (30초마다 자동 갱신 · 마지막 동기화:{' '}
+                  전체 엔드포인트 현황 요약 및 실시간 감사 로그 (온라인 상태 10초 · 변경 시 자동 갱신 · 마지막 동기화:{' '}
                   {lastRefreshed.toLocaleTimeString('ko-KR')})
                 </p>
               </div>
@@ -921,8 +994,14 @@ const showToast = (msg: string) => {
                     style={{ position: 'absolute', left: 10, top: 10, color: 'var(--text-muted)' }}
                   />
                 </div>
-                <button onClick={() => sendBatchCmd('scan')} className="btn btn-ghost">
-                  <RefreshCw size={13} style={{ color: 'var(--accent-text)' }} /> 선택 스캔
+                <button
+                  onClick={requestScan}
+                  className="btn btn-ghost"
+                  disabled={scanBusy}
+                  title="Windows 업데이트 목록만 다시 검색합니다 (설치하지 않음). 선택한 PC가 없으면 온라인 PC 전체"
+                >
+                  <RefreshCw size={13} style={{ color: 'var(--accent-text)' }} />{' '}
+                  {selectedIds.size ? `선택 PC 업데이트 다시 검색 (${selectedIds.size})` : '업데이트 다시 검색'}
                 </button>
                 <button onClick={() => sendBatchCmd('install_all')} className="btn btn-emerald">
                   <Download size={13} /> 차단 외 일괄 설치
@@ -1679,13 +1758,15 @@ const showToast = (msg: string) => {
                 </button>
               </div>
               <p style={{ margin: '0 0 12px', fontSize: 12.5, color: 'var(--text-secondary)' }}>
-                현재 로그인 계정: <strong>{username || '-'}</strong> · 계정 정보는 서버 PC의 별도 계정 DB(aurora_accounts.db)에
-                암호화(해시)되어 저장됩니다. 비밀번호를 변경하면 다른 PC의 로그인 세션은 모두 종료됩니다.
+                현재 로그인 계정: <strong>{username || '-'}</strong> ({role === 'admin' ? '관리자' : role === 'operator' ? '운영자' : '-'}) ·
+                계정 정보는 서버 PC의 별도 계정 DB에 암호화되어 저장됩니다. 비밀번호를 변경하면 다른 PC의 로그인 세션은 모두 종료됩니다.
               </p>
               <div style={{ maxWidth: 360 }}>
                 <PasswordChangeForm onChanged={() => showToast('✓ 비밀번호가 변경되었습니다.')} />
               </div>
             </section>
+
+            {role === 'admin' && <AccountManager currentUser={username} onToast={showToast} />}
 
             <section className="glass-card panel">
               <div className="panel-header">

@@ -7,6 +7,10 @@ const ACTION_LABEL: Record<string, string> = {
   login_fail: '로그인 실패',
   logout: '로그아웃',
   password_change: '비밀번호 변경',
+  account_create: '계정 생성',
+  account_delete: '계정 삭제',
+  account_reset: '비밀번호 초기화',
+  account_role: '권한 변경',
 };
 
 /** 콘솔 접속 로그 (최근 200건, 7일 보관) */

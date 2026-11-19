@@ -157,3 +157,23 @@ export interface SystemStatus {
   backup_file: string;
   rebuilt_tables: string[];
 }
+
+export interface ConsoleAccount {
+  username: string;
+  role: 'admin' | 'operator';
+  role_label: string;
+  must_change: boolean;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  last_active?: number | null;
+}
+
+/** 10초 주기 경량 상태 (온라인 판정 + 변경 감지) */
+export interface Presence {
+  now: number;
+  rev: string;
+  last_seen: Record<string, number>;
+  notification_count: number;
+  online_sec: number;
+}

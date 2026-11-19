@@ -47,9 +47,16 @@ def current_admin(
 
 
 def verify_admin(user: dict = Depends(current_admin)) -> dict:
-    """일반 관리 API용: 최초 임시 비밀번호 상태에서는 비밀번호 변경 전까지 사용 불가"""
+    """일반 관리 API용(관리자·운영자 공통): 임시 비밀번호 상태에서는 비밀번호 변경 전까지 사용 불가"""
     if user.get("must_change"):
         raise HTTPException(status_code=403, detail="PASSWORD_CHANGE_REQUIRED")
+    return user
+
+
+def require_admin_role(user: dict = Depends(verify_admin)) -> dict:
+    """계정 관리 등 '관리자' 권한 전용 API"""
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="관리자 권한이 필요한 기능입니다.")
     return user
 
 

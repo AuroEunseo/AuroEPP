@@ -17,3 +17,11 @@ aurora_accounts.db-*
 **/aurora_accounts.db-*
 initial_admin_password.txt
 **/initial_admin_password.txt
+__pycache__/
+*.pyc
+backend/*.db
+backend/*.db-*
+backend/backups/
+bak/*.db
+*.patch
+patch/

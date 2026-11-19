@@ -28,7 +28,9 @@ from wua_engine import (
 
 AGENT_VER = "1.0.2"
 CHECKIN_INTERVAL = 20
-AUTO_SCAN_INTERVAL = 300
+# Windows Update 검색은 무거운 작업(CPU·네트워크)이라 주기적으로 하지 않는다.
+# 검색 시점: ① 콘솔이 요청할 때(콘솔 첫 접속 시 자동 1회, [업데이트 다시 검색] 버튼, PC별 [즉시 스캔])
+#           ② 관리자가 KB 규칙을 바꿨을 때(숨김/허용 적용 후 결과 확인) ③ 설치 명령 실행 후
 
 REPORT_HISTORY_MAX = 30       # 정기 보고 시 전송하는 설치/제거 이력 건수
 FULL_HISTORY_MAX = 100        # 상세 모달 요청 시 전송하는 전체 이력 최대 건수
@@ -136,7 +138,8 @@ class AgentWorker:
                     merged_map[r["kb"]] = r["action"]
                 merged_rules = [{"kb": k, "action": v} for k, v in merged_map.items()]
 
-                if kind != "history_full" and (merged_rules or kind == "install_all"):
+                # 규칙 적용(숨김/해제/설치)은 '규칙 변경'·'설치 명령'일 때만. 단순 검색(scan)·이력 요청은 검색만 수행
+                if kind in ("rules", "install_all", "single_kb") and (merged_rules or kind == "install_all"):
                     msgs = enforce_updates(merged_rules, install_all=(kind == "install_all"))
 
                 scan_data = scan_updates()
@@ -216,7 +219,8 @@ class AgentWorker:
         return {"mac_addr": mac_addr, "cpu_info": cpu_info, "ram_gb": ram_gb}
 
     def _enqueue_job(self, kind: str, rules: list[dict] = None):
-        if kind != "sync" or (not self.busy.is_set() and self.job_queue.empty()):
+        # 단순 검색은 이미 작업 중이거나 대기 중이면 생략 (작업 끝에 어차피 검색 결과를 보고함)
+        if kind != "scan" or (not self.busy.is_set() and self.job_queue.empty()):
             self.job_queue.put({"kind": kind, "rules": rules or []})
 
     # ------------------------------------------------------------------
@@ -256,7 +260,7 @@ class AgentWorker:
         kb = cpayload.get("kb", "")
 
         if ctype == "scan":
-            self._enqueue_job("sync")
+            self._enqueue_job("scan")
         elif ctype == "install_all":
             self._enqueue_job("install_all")
         elif ctype == "install_kb" and kb:
@@ -319,8 +323,7 @@ class AgentWorker:
             fail_count = 0
 
             applied_hash = ""
-            seen_rules_hash = None
-            last_scan_ts = 0.0
+            seen_rules_hash = None  # 첫 체크인 응답 값으로 초기화만 하고 검색하지 않음
             hotfix = ""
 
             # Step 2: Check-in loop after approval
@@ -406,10 +409,12 @@ class AgentWorker:
                         self.wake_event.set()
 
                     # Sync update list on rule change or periodic interval
-                    if res.get("rules_hash") != seen_rules_hash or (time.time() - last_scan_ts > AUTO_SCAN_INTERVAL):
-                        self._enqueue_job("sync")
+                    # KB 규칙이 바뀐 경우에만 규칙 적용 + 검색 (서비스 시작 직후 첫 응답은 기준값만 기록)
+                    if seen_rules_hash is None:
                         seen_rules_hash = res.get("rules_hash")
-                        last_scan_ts = time.time()
+                    elif res.get("rules_hash") != seen_rules_hash:
+                        seen_rules_hash = res.get("rules_hash")
+                        self._enqueue_job("rules")
 
                     # Apply registry policy
                     pol = res.get("policy", {})

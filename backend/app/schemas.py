@@ -64,3 +64,17 @@ class LoginRequest(BaseModel):
 class PasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class AccountCreateRequest(BaseModel):
+    username: str
+    role: str = "operator"  # admin | operator
+    password: str = ""  # 비우면 임시 비밀번호 자동 발급
+
+
+class AccountRoleRequest(BaseModel):
+    role: str
+
+
+class ScanRequest(BaseModel):
+    machine_ids: List[str] = Field(default_factory=list)  # 비우면 온라인 PC 전체

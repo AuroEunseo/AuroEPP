@@ -32,6 +32,9 @@ from .models import (
     UpdateCatalog,
 )
 from .schemas import (
+    AccountCreateRequest,
+    AccountRoleRequest,
+    ScanRequest,
     CheckinRequest,
     CommandRequest,
     DecisionRequest,
@@ -47,6 +50,7 @@ from .security import (
     client_ip,
     current_admin,
     hash_token,
+    require_admin_role,
     require_ready,
     verify_admin,
     verify_agent,
@@ -740,8 +744,11 @@ def login(req: LoginRequest, request: Request):
                                f"계정 '{req.username[:32]}' / {ip} 에서 로그인 실패가 반복되어 5분간 잠겼습니다.")
                 db.commit()
         raise HTTPException(status_code=401, detail=msg)
-    token = accounts.create_session(req.username.strip(), ip)
-    return {"token": token, "username": req.username.strip(), "must_change": must_change}
+    username = accounts.canonical_username(req.username)
+    token = accounts.create_session(username, ip)
+    _trigger_initial_scan()
+    user = accounts.get_session_user(token) or {}
+    return {"token": token, "username": username, "must_change": must_change, "role": user.get("role", "operator")}
 
 
 @app.post("/api/auth/logout")
@@ -753,7 +760,7 @@ def logout(request: Request, user: dict = Depends(current_admin)):
 
 @app.get("/api/auth/me")
 def me(user: dict = Depends(current_admin)):
-    return {"username": user["username"], "must_change": user["must_change"]}
+    return {"username": user["username"], "must_change": user["must_change"], "role": user.get("role", "operator")}
 
 
 @app.post("/api/auth/password")
@@ -783,6 +790,160 @@ def system_retry(_: dict = Depends(current_admin)):
         raise HTTPException(status_code=409, detail="이미 진행 중입니다.")
     threading.Thread(target=_startup_sequence, daemon=True).start()
     return {"ok": True}
+
+
+# ==========================================
+# 업데이트 검색: 에이전트는 스스로 주기 검색하지 않고, 콘솔이 요청할 때만 검색한다
+# ==========================================
+_initial_scan_lock = threading.Lock()
+_initial_scan_done = False
+
+
+def _scan_online_agents(db: Session, machine_ids: list[str] | None = None) -> tuple[list[str], list[str]]:
+    """온라인 PC에만 '업데이트 검색' 명령 전달 (오프라인 PC는 대기열에 넣지 않음). (전달, 제외) 호스트명 반환"""
+    q = db.query(Agent).filter(Agent.status == "active")
+    if machine_ids:
+        q = q.filter(Agent.machine_id.in_(machine_ids))
+    sent, skipped, sent_ids = [], [], []
+    for a in q.all():
+        if not is_online(a):
+            skipped.append(a.hostname)
+            continue
+        if _queue_command(db, a, "scan", {}) in ("sent", "duplicate"):
+            sent.append(a.hostname)
+            sent_ids.append(a.machine_id)
+    db.commit()
+    for mid in sent_ids:
+        notify_agent_realtime(mid, "command")
+    return sent, skipped
+
+
+def _trigger_initial_scan():
+    """콘솔 실행(서버 시작) 후 첫 로그인 때 1회: 온라인 PC 전체에 업데이트 검색 요청"""
+    global _initial_scan_done
+    with _initial_scan_lock:
+        if _initial_scan_done:
+            return
+        _initial_scan_done = True
+
+    def run():
+        for _ in range(120):  # DB 준비(백업/마이그레이션) 완료까지 최대 2분 대기
+            if get_status()["ready"]:
+                break
+            time.sleep(1)
+        else:
+            return
+        try:
+            with SessionLocal() as db:
+                sent, skipped = _scan_online_agents(db)
+                log_event(db, "console", f"콘솔 시작 시 업데이트 검색 요청 → 온라인 {len(sent)}대 (오프라인 {len(skipped)}대 제외)")
+                db.commit()
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+@app.post("/api/scan", dependencies=ADMIN_DEPS)
+def request_scan(req: ScanRequest, db: Session = Depends(get_db)):
+    """[업데이트 다시 검색] 버튼: 업데이트 검색만 수행 (설치·규칙 적용 없음). machine_ids 를 비우면 온라인 PC 전체"""
+    sent, skipped = _scan_online_agents(db, req.machine_ids or None)
+    log_event(db, "console", f"업데이트 검색 요청 → 온라인 {len(sent)}대" + (f" (오프라인 {len(skipped)}대 제외)" if skipped else ""))
+    db.commit()
+    return {"ok": True, "sent": len(sent), "skipped": skipped}
+
+
+# ==========================================
+# 경량 상태 조회 (10초 주기): 온라인 판정 + 변경 감지
+# ==========================================
+@app.get("/api/presence", dependencies=ADMIN_DEPS)
+def presence(db: Session = Depends(get_db)):
+    """콘솔이 10초마다 호출하는 가벼운 응답.
+    - last_seen: PC별 마지막 통신 시각 → 온라인/오프라인 표시를 10초 단위로 갱신
+    - rev: 데이터 변경 지표. 값이 바뀌었을 때만 콘솔이 전체 상태(/api/state)를 다시 받는다
+    """
+    from sqlalchemy import func
+
+    rows = db.query(Agent.machine_id, Agent.status, Agent.last_seen, Agent.upd_ts, Agent.hist_ts,
+                    Agent.applied_hash, Agent.ring, Agent.reconnect_watch_since).all()
+    sig = hashlib.sha1()
+    last_seen = {}
+    for r in rows:
+        last_seen[r.machine_id] = r.last_seen
+        sig.update(f"{r.machine_id}|{r.status}|{r.upd_ts}|{r.hist_ts}|{r.applied_hash}|{r.ring}|"
+                   f"{bool(r.reconnect_watch_since)}".encode())
+    max_event = db.query(func.max(EventLog.id)).scalar() or 0
+    cmd_count = db.query(func.count(AgentCommand.id)).scalar() or 0
+    notif_count = db.query(func.count(Notification.id)).scalar() or 0
+    sig.update(f"{max_event}|{cmd_count}|{notif_count}".encode())
+    return {
+        "now": time.time(),
+        "rev": sig.hexdigest()[:16],
+        "last_seen": last_seen,
+        "notification_count": notif_count,
+        "online_sec": ONLINE_WINDOW_SEC,
+    }
+
+
+# ==========================================
+# 콘솔 계정 관리 (관리자 권한 전용)
+# ==========================================
+ACCOUNT_DEPS = [Depends(require_ready)]
+
+
+def _account_audit(actor: dict, request: Request, action: str, ok: bool, detail: str):
+    write_access_log(actor["username"], client_ip(request), action, ok, detail)
+
+
+@app.get("/api/accounts", dependencies=ACCOUNT_DEPS)
+def list_accounts(_: dict = Depends(require_admin_role)):
+    return accounts.list_accounts()
+
+
+@app.post("/api/accounts", dependencies=ACCOUNT_DEPS)
+def create_account(req: AccountCreateRequest, request: Request, actor: dict = Depends(require_admin_role)):
+    ok, msg, temp = accounts.create_account(req.username, req.role, actor["username"], req.password)
+    _account_audit(actor, request, "account_create", ok, f"{req.username.strip()[:32]} ({req.role})" + ("" if ok else f": {msg}"))
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    with SessionLocal() as db:
+        notify_console(db, "info", "security", f"콘솔 계정 생성: {req.username.strip()}",
+                       f"{actor['username']} 님이 {accounts.ROLE_LABEL[req.role]} 계정을 만들었습니다.")
+        db.commit()
+    return {"ok": True, "message": msg, "temp_password": temp}
+
+
+@app.delete("/api/accounts/{username}", dependencies=ACCOUNT_DEPS)
+def delete_account(username: str, request: Request, actor: dict = Depends(require_admin_role)):
+    ok, msg = accounts.delete_account(username, actor["username"])
+    _account_audit(actor, request, "account_delete", ok, username[:32] + ("" if ok else f": {msg}"))
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    with SessionLocal() as db:
+        notify_console(db, "warn", "security", f"콘솔 계정 삭제: {username}", f"{actor['username']} 님이 삭제했습니다.")
+        db.commit()
+    return {"ok": True, "message": msg}
+
+
+@app.post("/api/accounts/{username}/reset-password", dependencies=ACCOUNT_DEPS)
+def reset_account_password(username: str, request: Request, actor: dict = Depends(require_admin_role)):
+    if username.strip().lower() == actor["username"].lower():
+        raise HTTPException(status_code=400, detail="본인 비밀번호는 위의 '비밀번호 변경'에서 바꾸세요.")
+    ok, msg, temp = accounts.admin_reset_password(username)
+    _account_audit(actor, request, "account_reset", ok, username[:32] + ("" if ok else f": {msg}"))
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"ok": True, "message": msg, "temp_password": temp}
+
+
+@app.put("/api/accounts/{username}/role", dependencies=ACCOUNT_DEPS)
+def change_account_role(username: str, req: AccountRoleRequest, request: Request,
+                        actor: dict = Depends(require_admin_role)):
+    ok, msg = accounts.set_role(username, req.role, actor["username"])
+    _account_audit(actor, request, "account_role", ok, f"{username[:32]} → {req.role}" + ("" if ok else f": {msg}"))
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"ok": True, "message": msg}
 
 
 @app.get("/api/access-logs", dependencies=ADMIN_DEPS)
