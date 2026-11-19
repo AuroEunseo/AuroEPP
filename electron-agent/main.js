@@ -304,6 +304,8 @@ ipcMain.handle('get-state', async () => {
   return { identity, config, serviceStatus, serverReachable };
 });
 
+ipcMain.handle('get-tasks', () => readTasks().tasks);
+
 ipcMain.handle('save-config', async (_event, { ip, port }) => {
   writeServerConfig(ip, port);
   return await restartAgentService();
@@ -313,16 +315,43 @@ ipcMain.handle('restart-service', async () => {
   return await restartAgentService();
 });
 
-function createTray() {
-  const icon = nativeImage
-    .createFromDataURL(TRAY_ICON_DATA_URL)
-    .resize({ width: 16, height: 16 });
-  tray = new Tray(icon);
-  tray.setToolTip(`${APP_TITLE} (백그라운드 상시 실행 중)`);
+// ------------------------------------------------------------------
+// 작업 현황 (서비스가 기록하는 tasks.json → 트레이 메뉴 '진행 중인 작업' / 설정 창)
+// ------------------------------------------------------------------
+const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
+let lastTasksStamp = 0;
+let notifiedFinished = null; // 이미 알림을 띄운 완료 작업 ID
 
-  const contextMenu = Menu.buildFromTemplate([
+function readTasks() {
+  const data = readJsonSafe(TASKS_FILE, { updated: 0, tasks: [] });
+  return { updated: data.updated || 0, tasks: Array.isArray(data.tasks) ? data.tasks : [] };
+}
+
+function taskLabel(t) {
+  const pct = t.progress != null && !t.finished && t.status === '다운로드 중' ? ` ${t.progress}%` : '';
+  const state = t.finished ? (t.ok ? '완료' : '실패') : t.status;
+  return `${t.title} — ${state}${pct}`;
+}
+
+function buildTrayMenu(tasks) {
+  const active = tasks.filter((t) => !t.finished);
+  const recent = tasks.filter((t) => t.finished).slice(-5).reverse();
+  return Menu.buildFromTemplate([
     {
-      label: '에이전트 설정 및 토큰 열기',
+      label: active.length ? `진행 중인 작업 (${active.length})` : '진행 중인 작업 없음',
+      enabled: active.length > 0,
+      submenu: active.length ? active.map((t) => ({ label: taskLabel(t), enabled: false })) : undefined,
+    },
+    {
+      label: '최근 완료된 작업',
+      enabled: recent.length > 0,
+      submenu: recent.length
+        ? recent.map((t) => ({ label: `${t.ok ? '✔' : '✖'} ${t.title} (${new Date(t.finished * 1000).toLocaleTimeString('ko-KR')})`, enabled: false }))
+        : undefined,
+    },
+    { type: 'separator' },
+    {
+      label: '에이전트 설정 및 작업 현황 열기',
       click: () => showStatusWindow(),
     },
     {
@@ -354,16 +383,53 @@ function createTray() {
       },
     },
   ]);
+}
 
-  tray.setContextMenu(contextMenu);
+// 2초마다 작업 현황을 읽어 트레이 메뉴·툴팁을 갱신하고, 프로그램 설치가 끝나면 알림 풍선 표시
+function refreshTasks() {
+  if (!tray || tray.isDestroyed()) return;
+  const { updated, tasks } = readTasks();
+  if (updated === lastTasksStamp) return;
+  lastTasksStamp = updated;
+  tray.setContextMenu(buildTrayMenu(tasks));
+  const active = tasks.filter((t) => !t.finished);
+  const tip = active.length ? `${APP_TITLE} — ${taskLabel(active[0])}${active.length > 1 ? ` 외 ${active.length - 1}건` : ''}` : `${APP_TITLE} (백그라운드 상시 실행 중)`;
+  tray.setToolTip(tip.slice(0, 120));
+
+  const finished = tasks.filter((t) => t.finished);
+  if (notifiedFinished === null) {
+    notifiedFinished = new Set(finished.map((t) => t.id)); // 앱 시작 전 완료분은 알리지 않음
+    return;
+  }
+  for (const t of finished) {
+    if (notifiedFinished.has(t.id)) continue;
+    notifiedFinished.add(t.id);
+    if (t.kind === 'package') {
+      tray.displayBalloon({
+        title: t.ok ? '프로그램 작업 완료' : '프로그램 작업 실패',
+        content: `${t.title}${t.detail ? `\n${t.detail}` : ''}`.slice(0, 250),
+      });
+    }
+  }
+}
+
+function createTray() {
+  const icon = nativeImage
+    .createFromDataURL(TRAY_ICON_DATA_URL)
+    .resize({ width: 16, height: 16 });
+  tray = new Tray(icon);
+  tray.setToolTip(`${APP_TITLE} (백그라운드 상시 실행 중)`);
+  tray.setContextMenu(buildTrayMenu([]));
   tray.on('click', () => showStatusWindow());
   tray.on('double-click', () => showStatusWindow());
+  refreshTasks();
+  setInterval(refreshTasks, 2000);
 }
 
 function createStatusWindow(startHidden = false) {
   mainWindow = new BrowserWindow({
     width: 540,
-    height: 570,
+    height: 760,
     show: !startHidden,
     resizable: false,
     autoHideMenuBar: true,

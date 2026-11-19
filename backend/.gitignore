@@ -1,3 +1,8 @@
 # 계정 DB 암호화 키 (절대 커밋 금지 — 유출 시 계정 DB 복호화 가능)
 accounts.key
 accounts.key.tmp
+
+# 프로그램 배포 서명 키 (유출 시 위조 명령 서명 가능) / 업로드된 설치 파일
+signing.key
+signing.key.tmp
+packages/

@@ -119,6 +119,7 @@ export interface QueuedCommand {
 
 export interface AgentDetail {
   machine_id: string;
+  deployments?: Deployment[];
   online: boolean;
   boot_ts?: number | null;
   reconnect_waiting?: boolean;
@@ -187,5 +188,59 @@ export type MenuKey =
   | 'notifications'
   | 'policy-registry'
   | 'policy-rules'
+  | 'programs'
   | 'logs'
   | 'settings';
+
+/** 사내 공용 프로그램 (배포용 설치 파일) */
+export interface SoftwarePackage {
+  id: number;
+  name: string;
+  version: string;
+  publisher: string;
+  filename: string;
+  size: number;
+  sha256: string;
+  kind: 'msi' | 'exe';
+  install_args: string;
+  uninstall_cmd: string;
+  detect_name: string;
+  timeout_min: number;
+  notes: string;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  installed_count?: number;
+  active_count?: number;
+  failed_count?: number;
+}
+
+/** PC 1대에 대한 프로그램 설치/삭제 요청 */
+export interface Deployment {
+  id: number;
+  package_id: number;
+  machine_id: string;
+  action: 'install' | 'uninstall';
+  status: 'queued' | 'sent' | 'downloading' | 'installing' | 'uninstalling' | 'success' | 'failed' | 'cancelled';
+  status_label: string;
+  progress: number;
+  exit_code: number | null;
+  message: string;
+  requested_by: string;
+  created_at: number;
+  updated_at: number;
+  package_name: string;
+  package_version: string;
+}
+
+export interface PackageStatusRow {
+  machine_id: string;
+  hostname: string;
+  ip: string;
+  ring: string;
+  online: boolean;
+  installed: boolean;
+  installed_version: string;
+  software_ts: number | null;
+  deployment: Deployment | null;
+}

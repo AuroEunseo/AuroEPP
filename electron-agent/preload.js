@@ -4,4 +4,5 @@ contextBridge.exposeInMainWorld('agentApi', {
   getState: () => ipcRenderer.invoke('get-state'),
   saveConfig: (ip, port) => ipcRenderer.invoke('save-config', { ip, port }),
   restartService: () => ipcRenderer.invoke('restart-service'),
+  getTasks: () => ipcRenderer.invoke('get-tasks'),
 });

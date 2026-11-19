@@ -9,6 +9,7 @@ import { PendingPcsPage } from './pages/PendingPcsPage';
 import { RejectedPcsPage } from './pages/RejectedPcsPage';
 import { PolicyRegistryPage } from './pages/PolicyRegistryPage';
 import { KbRulesPage } from './pages/KbRulesPage';
+import { ProgramsPage } from './pages/ProgramsPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { LogsPage } from './pages/LogsPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -28,6 +29,7 @@ const PAGES: Record<MenuKey, React.ReactNode> = {
   'pcs-rejected': <RejectedPcsPage />,
   'policy-registry': <PolicyRegistryPage />,
   'policy-rules': <KbRulesPage />,
+  programs: <ProgramsPage />,
   notifications: <NotificationsPage />,
   logs: <LogsPage />,
   settings: <SettingsPage />,

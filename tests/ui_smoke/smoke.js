@@ -1,5 +1,5 @@
 // 콘솔 화면 스모크 테스트
-//  로그인 → 모든 메뉴 순회 → PC 상세 → 검색 → 정책 그룹 전환 → KB 입력
+//  로그인 → 모든 메뉴 순회 → PC 상세 → 검색 → 정책 그룹 전환 → KB 입력 → 프로그램별 PC 현황
 //  각 화면의 텍스트(시간 표시는 <TS> 등으로 정규화)를 JSON으로 저장한다.
 //  사용법: node smoke.js <출력파일.json> <콘솔 주소> <admin 비밀번호>
 const { chromium } = require('playwright');
@@ -13,6 +13,7 @@ const norm = (t) =>
     .replace(/\d+초 전/g, '<N>초 전')
     .replace(/:\d{4,5}\b/g, ':<PORT>')
     .replace(/포트 \d+/g, '포트 <PORT>')
+    .replace(/서명 키 [A-Za-z0-9+/=]+…/g, '서명 키 <KEY>…')
     .replace(/[ \t]+/g, ' ')
     .trim();
 
@@ -43,6 +44,7 @@ const norm = (t) =>
     [sub('거부 PC'), 'pcs_rejected'],
     [sub('레지스트리 정책 관리'), 'policy_registry'],
     [sub('Windows 업데이트 규칙'), 'policy_rules'],
+    [top('프로그램 관리'), 'programs'],
     [top('알림'), 'notifications'],
     [top('로그 관리'), 'logs'],
     [top('설정'), 'settings'],
@@ -79,6 +81,13 @@ const norm = (t) =>
   const kb = await p.$('input[placeholder*="KB"]');
   if (kb) await kb.fill('KB5022222');
   await shot('rules_input');
+
+  // 프로그램 관리: 첫 프로그램의 PC별 현황
+  await p.click(top('프로그램 관리'));
+  await p.waitForTimeout(500);
+  await p.click('tbody tr >> nth=0');
+  await p.waitForTimeout(1200);
+  await shot('programs_status');
 
   fs.writeFileSync(OUT, JSON.stringify({ snap, errs }, null, 1));
   console.log(`화면 ${Object.keys(snap).length}개 기록, 런타임 오류 ${errs.length}건`);

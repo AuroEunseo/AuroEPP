@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Bell, ChevronDown, ChevronRight, LayoutDashboard, Monitor, Settings, Shield, Terminal } from 'lucide-react';
+import { Bell, ChevronDown, ChevronRight, LayoutDashboard, Monitor, Package, Settings, Shield, Terminal } from 'lucide-react';
 import { useConsole } from '../context/ConsoleContext';
 import { THEMES } from '../constants/themes';
 import logoUrl from '../assets/ac1.png';
@@ -146,6 +146,16 @@ export const Sidebar: React.FC = () => {
             </div>
           )}
         </div>
+
+        <button
+          className={`nav-item ${activeMenu === 'programs' ? 'active' : ''}`}
+          onClick={() => navigate('programs')}
+        >
+          <span className="nav-item-left">
+            <Package size={16} />
+            <span>프로그램 관리</span>
+          </span>
+        </button>
 
         <button
           className={`nav-item ${activeMenu === 'notifications' ? 'active' : ''}`}

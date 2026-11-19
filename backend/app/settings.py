@@ -32,6 +32,8 @@ RECONNECT_WATCH_SEC = 600       # 재부팅 명령 전달 후 이 시간 안에 
 RETENTION_DAYS = 7              # 이벤트/명령/접속/알림 로그 보관 기간
 HISTORY_KEEP = 100              # PC별 서버 보관(=콘솔 표시) 업데이트 이력 최대 건수
 REGISTRY_CHANGE_KEEP = 200      # PC별 레지스트리 변경 이력 최대 보관 건수
+PACKAGE_MAX_BYTES = 4 * 1024**3  # 업로드 가능한 설치 파일 최대 크기 (4GB)
+DEPLOY_KEEP_DAYS = 30           # 프로그램 배포 기록 보관 기간
 SESSION_HOURS = 12              # 콘솔 로그인 세션 유효 시간(마지막 사용 기준)
 
 

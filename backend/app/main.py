@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from . import accounts
+from . import accounts, packages
 from .catalog_sync import sync_catalog_database
 from .database import BASE_DIR, SessionLocal, get_db, secure_data_dir
 from .migrations import get_status, run_startup
@@ -196,7 +196,9 @@ def cleanup_old_records():
         for c in expired:
             host = c.agent.hostname if c.agent else c.machine_id
             log_event(db, host, f"대기 명령 만료 [{c.cmd_type}] ({COMMAND_KEEP_DAYS}일 동안 PC가 켜지지 않음)")
+            packages.on_command_expired(db, c)
             db.delete(c)
+        packages.cleanup(db)
         db.commit()
     accounts.purge_expired_sessions()
 
@@ -369,6 +371,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 프로그램 배포 API (SPA 기본 경로보다 먼저 등록해야 함)
+app.include_router(packages.router)
+
 
 # ==========================================
 # 0. 상태 확인 (로그인 전/후 공용)
@@ -401,7 +406,8 @@ def register_agent(req: RegisterRequest, request: Request, db: Session = Depends
             agent.last_seen = time.time()
             agent.ip = ip
             db.commit()
-            return {"status": "active", "ring": agent.ring}
+            # 서버 서명 공개키: 에이전트가 처음 받은 값을 고정해 프로그램 배포 명령 검증에 사용
+            return {"status": "active", "ring": agent.ring, "signing_pubkey": packages.public_key_b64()}
         if agent.status == "pending" and agent.token_hash == t_hash:
             # 승인 대기 중 주기적 재요청: 응답 시각만 갱신 (승인 시 '통신 확인'에 사용)
             agent.last_seen = time.time()
@@ -594,6 +600,9 @@ def agent_checkin(
 
     if req.reg_changes:
         _store_reg_changes(db, agent, req.reg_changes)
+    if req.software is not None:
+        agent.software_json = json.dumps(req.software[:3000], ensure_ascii=False)
+        agent.software_ts = now
 
     for r in req.results:
         rtype = str(r.get("type"))
@@ -646,6 +655,7 @@ def agent_checkin(
             db.delete(c)
             continue
         commands_out.append({"id": c.id, "type": c.cmd_type, "payload": json.loads(c.payload_json or "{}")})
+        packages.on_command_delivered(db, c)
         if waited > ONLINE_WINDOW_SEC:
             log_event(db, agent.hostname, f"대기 명령 전달 [{c.cmd_type}] (보관 {_fmt_duration(waited)} 후 적용)")
         if c.cmd_type == "reboot":
@@ -668,6 +678,7 @@ def agent_checkin(
         "rules": rules_out,
         "rules_hash": policy_hash(rules_out),
         "commands": commands_out,
+        "signing_pubkey": packages.public_key_b64(),
     }
 
 
@@ -1096,6 +1107,7 @@ def agent_detail(machine_id: str, db: Session = Depends(get_db)):
             }
             for c in sorted(agent.commands, key=lambda x: x.id)
         ],
+        "deployments": packages.agent_deployments(db, machine_id),
         "registry_changes": [
             {
                 "id": c.id, "ts": c.ts, "source": c.source, "policy_hash": c.policy_hash,
@@ -1183,6 +1195,7 @@ CMD_LABEL = {
     "scan": "업데이트 스캔", "install_all": "차단 외 일괄 설치", "install_kb": "KB 단독 설치",
     "hide_kb": "KB 숨기기", "unhide_kb": "KB 숨김 해제", "reboot": "재부팅", "shutdown": "전원 종료",
     "report_history": "전체 이력 보고", "reg_rollback": "레지스트리 롤백",
+    "pkg_install": "프로그램 설치", "pkg_uninstall": "프로그램 삭제",
 }
 
 
@@ -1201,6 +1214,7 @@ def cancel_queued_command(machine_id: str, command_id: int, db: Session = Depend
         if ch and ch.rollback_state == "requested":
             ch.rollback_state = ""
             ch.rollback_msg = "롤백 요청 취소됨"
+    packages.on_command_cancelled(db, c)
     db.delete(c)
     log_event(db, "console", f"대기 명령 취소 [{CMD_LABEL.get(c.cmd_type, c.cmd_type)}] → {agent.hostname}")
     db.commit()

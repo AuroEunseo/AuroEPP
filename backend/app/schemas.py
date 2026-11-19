@@ -54,6 +54,8 @@ class CheckinRequest(BaseModel):
     boot_ts: Optional[float] = None
     service_started_at: Optional[float] = None
     first_checkin: bool = False
+    # 설치된 프로그램 목록 (서비스 시작 후 첫 보고, 프로그램 설치/삭제 후, 검색 요청 시에만 전송)
+    software: Optional[List[Dict[str, Any]]] = None
 
 
 class LoginRequest(BaseModel):
@@ -78,3 +80,38 @@ class AccountRoleRequest(BaseModel):
 
 class ScanRequest(BaseModel):
     machine_ids: List[str] = Field(default_factory=list)  # 비우면 온라인 PC 전체
+
+class PackageCreateRequest(BaseModel):
+    upload_id: str
+    name: str
+    version: str = ""
+    publisher: str = ""
+    install_args: str = ""
+    uninstall_cmd: str = ""
+    detect_name: str = ""
+    timeout_min: int = 30
+    notes: str = ""
+
+
+class PackageUpdateRequest(BaseModel):
+    name: str
+    version: str = ""
+    publisher: str = ""
+    install_args: str = ""
+    uninstall_cmd: str = ""
+    detect_name: str = ""
+    timeout_min: int = 30
+    notes: str = ""
+
+
+class DeployRequest(BaseModel):
+    machine_ids: List[str]
+    action: str = "install"  # install | uninstall
+
+
+class ProgressReport(BaseModel):
+    deployment_id: int
+    status: str
+    progress: int = 0
+    message: str = ""
+    exit_code: Optional[int] = None

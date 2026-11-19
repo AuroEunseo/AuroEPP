@@ -17,7 +17,6 @@
    이 암호화는 DB 파일·백업이 외부로 유출됐을 때를 대비한 것이다.
 """
 import base64
-import ctypes
 import hashlib
 import hmac
 import json
@@ -32,6 +31,7 @@ import time
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .database import BASE_DIR
+from .keystore import unwrap_key as _unwrap_key, wrap_key as _wrap_key
 from .settings import SESSION_HOURS
 
 ACCOUNTS_DB = os.path.join(BASE_DIR, "aurora_accounts.db")
@@ -55,43 +55,6 @@ _key_cache: bytes | None = None
 # ==========================================================
 # 키 관리 (Windows DPAPI 보호)
 # ==========================================================
-class _DataBlob(ctypes.Structure):
-    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-
-def _dpapi(data: bytes, protect: bool) -> bytes:
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
-    buf = ctypes.create_string_buffer(data, len(data))
-    blob_in = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-    blob_out = _DataBlob()
-    CRYPTPROTECT_LOCAL_MACHINE = 0x4
-    CRYPTPROTECT_UI_FORBIDDEN = 0x1
-    flags = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN
-    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
-    ok = fn(ctypes.byref(blob_in), None, None, None, None, flags, ctypes.byref(blob_out))
-    if not ok:
-        raise OSError(f"DPAPI {'암호화' if protect else '복호화'} 실패 (오류 {ctypes.GetLastError()})")
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        kernel32.LocalFree(blob_out.pbData)
-
-
-def _wrap_key(key: bytes) -> bytes:
-    if sys.platform == "win32":
-        return b"DPAPI1" + _dpapi(key, True)
-    return b"PLAIN1" + key  # 개발(비 Windows) 환경용
-
-
-def _unwrap_key(blob: bytes) -> bytes:
-    if blob.startswith(b"DPAPI1"):
-        return _dpapi(blob[6:], False)
-    if blob.startswith(b"PLAIN1"):
-        return blob[6:]
-    raise ValueError("알 수 없는 키 파일 형식")
-
-
 def _master_key() -> bytes:
     global _key_cache
     if _key_cache:

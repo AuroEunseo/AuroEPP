@@ -18,6 +18,7 @@ const CATEGORY_LABEL: Record<string, string> = {
   agent: '에이전트',
   system: '시스템',
   security: '보안',
+  deploy: '프로그램 배포',
 };
 
 /** 확인이 필요한 이벤트 모음. '확인'을 누르면 서버에서 삭제되어 다시 표시되지 않는다. */

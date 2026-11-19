@@ -81,6 +81,14 @@ def seed(srv_dir):
         }, headers={"X-Machine-ID": f"SYN-{i}", "X-Agent-Token": f"tok{i}" * 8})
     call("/api/rules", {"kb": "KB5011111", "ring": "*", "action": "block", "note": "합성 규칙"}, t)
     call("/api/rings", {"ring": "ring-test", "copy_from": "ring1"}, t)
+    # 합성 설치 파일 1개 등록 (실제 프로그램 아님, 내용은 고정된 더미 바이트)
+    req = urllib.request.Request(BASE + "/api/packages/upload", data=b"AURORA-SMOKE-DUMMY-INSTALLER" * 1000,
+                                 headers={"X-Session-Token": t, "X-File-Name": "SampleTool-1.2.0-setup.exe",
+                                          "Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        up = json.loads(r.read())
+    call("/api/packages", {"upload_id": up["upload_id"], "name": "SampleTool", "version": "1.2.0",
+                           "install_args": "/S", "detect_name": "SampleTool"}, t)
     call("/api/auth/logout", {}, t)
     # 로그인 시 '콘솔 시작 검색'이 온라인 PC를 대상으로 하도록 마지막 통신 시각을 현재로
     c = sqlite3.connect(os.path.join(srv_dir, "aurora_enterprise.db"))

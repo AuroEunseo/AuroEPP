@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { X, Download, EyeOff, Eye, ShieldOff, RefreshCw, Trash2, History, Undo2, Wrench, Clock } from 'lucide-react';
+import { X, Download, EyeOff, Eye, ShieldOff, RefreshCw, Trash2, History, Undo2, Wrench, Clock, Package } from 'lucide-react';
 import { Agent, AgentDetail, QueuedCommand, RegistryChange } from '../types';
 import { apiFetch, errorMessage } from '../api';
+import { DeploymentBadge } from './programs/DeploymentBadge';
 import {
   HISTORY_OP,
   HISTORY_RESULT,
@@ -360,6 +361,31 @@ export const AgentDrawer: React.FC<Props> = ({ agent, onClose, onRefresh }) => {
             </div>
           )}
         </div>
+
+        {/* 프로그램 배포 이력 (프로그램 관리 메뉴에서 요청한 설치·삭제) */}
+        {(detail?.deployments?.length ?? 0) > 0 && (
+          <div>
+            <h4 style={sectionTitle}>
+              <Package size={14} /> 프로그램 설치·삭제 이력 ({detail!.deployments!.length}건)
+            </h4>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {detail!.deployments!.map((d) => (
+                <div key={d.id} style={{ ...subCard, padding: '8px 12px', display: 'flex', gap: 10, alignItems: 'center', fontSize: 12 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <strong>
+                      {d.package_name} {d.package_version}
+                    </strong>
+                    <div style={{ color: d.status === 'failed' ? '#f43f5e' : 'var(--text-muted)', fontSize: 11.5, marginTop: 2 }}>
+                      {fmtTs(d.updated_at)} · {d.requested_by}
+                      {d.message ? ` · ${d.message}` : ''}
+                    </div>
+                  </div>
+                  <DeploymentBadge d={d} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* 레지스트리 변경 이력 + 롤백 */}
         <div>

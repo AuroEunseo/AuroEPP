@@ -15,7 +15,7 @@ Python 쪽은 `backend/requirements.txt` 가 설치된 환경이면 됩니다. `
 ```
 python tests/ui_smoke/run_smoke.py
 ```
-- 결과: `화면 14/14 일치, 런타임 오류 0건` 이면 정상
+- 결과: `화면 16/16 일치, 런타임 오류 0건` 이면 정상
 - 다르면 어떤 화면의 어떤 글자가 바뀌었는지 보여 주고 종료 코드 1로 끝납니다.
 
 ## 화면을 의도적으로 바꾼 경우
@@ -24,6 +24,6 @@ python tests/ui_smoke/run_smoke.py
 python tests/ui_smoke/run_smoke.py --update-baseline
 ```
 
-## 점검하는 화면 (14개)
-로그인, 대시보드, 관리중 PC, 승인 대기 PC, 거부 PC, 레지스트리 정책, Windows 업데이트 규칙, 알림, 로그, 설정,
-PC 상세, PC 검색 결과, 정책 그룹 전환(ring0), KB 입력 상태
+## 점검하는 화면 (16개)
+로그인, 대시보드, 관리중 PC, 승인 대기 PC, 거부 PC, 레지스트리 정책, Windows 업데이트 규칙, 프로그램 관리, 알림, 로그, 설정,
+PC 상세, PC 검색 결과, 정책 그룹 전환(ring0), KB 입력 상태, 프로그램별 PC 현황

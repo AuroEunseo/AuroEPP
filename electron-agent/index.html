@@ -44,6 +44,15 @@
   .mono { font-family: Consolas, monospace; color: #7dd3fc; word-break: break-all; }
   .msg { margin-top: 10px; font-size: 12px; color: #34d399; min-height: 18px; }
   .hint { font-size: 11px; color: #64748b; text-align: center; margin-top: 6px; }
+  .tasks { display: flex; flex-direction: column; gap: 6px; max-height: 170px; overflow-y: auto; }
+  .task { background: #0f172a; border: 1px solid rgba(148,163,184,0.18); border-radius: 8px; padding: 7px 10px; font-size: 12px; }
+  .task-head { display: flex; justify-content: space-between; gap: 8px; }
+  .task-state { font-size: 11px; white-space: nowrap; }
+  .task-state.run { color: #fbbf24; } .task-state.ok { color: #34d399; } .task-state.fail { color: #fb7185; }
+  .task-detail { color: #94a3b8; font-size: 11px; margin-top: 3px; word-break: break-all; }
+  .bar { height: 4px; background: #1e293b; border-radius: 2px; margin-top: 5px; overflow: hidden; }
+  .bar > div { height: 100%; background: #38bdf8; }
+  .task-empty { font-size: 12px; color: #64748b; }
 </style>
 </head>
 <body>
@@ -84,6 +93,11 @@
       </div>
       <input id="agentToken" readonly style="color:#a5b4fc; font-size:11px;" />
     </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">작업 현황 (관제 서버가 요청한 설치·업데이트 작업)</div>
+    <div id="taskList" class="tasks"><div class="task-empty">진행 중인 작업이 없습니다.</div></div>
   </div>
 
   <div class="hint">창을 닫아도 트레이 아이콘으로 백그라운드에서 계속 실행됩니다.</div>
@@ -149,8 +163,31 @@
     msg.textContent = '에이전트 인증 토큰이 클립보드에 복사되었습니다.';
   }
 
+  function esc(s) { return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+  async function loadTasks() {
+    if (!window.agentApi?.getTasks) return;
+    const tasks = await window.agentApi.getTasks();
+    const active = tasks.filter((t) => !t.finished);
+    const done = tasks.filter((t) => t.finished).slice(-8).reverse();
+    const list = [...active, ...done];
+    const el = document.getElementById('taskList');
+    if (!list.length) { el.innerHTML = '<div class="task-empty">진행 중인 작업이 없습니다.</div>'; return; }
+    el.innerHTML = list.map((t) => {
+      const cls = t.finished ? (t.ok ? 'ok' : 'fail') : 'run';
+      const state = t.finished ? (t.ok ? '완료' : '실패') : t.status;
+      const time = new Date((t.finished || t.started) * 1000).toLocaleTimeString('ko-KR');
+      const bar = !t.finished && t.progress != null ? `<div class="bar"><div style="width:${t.progress}%"></div></div>` : '';
+      return `<div class="task"><div class="task-head"><span>${esc(t.title)}</span>` +
+        `<span class="task-state ${cls}">${esc(state)}${!t.finished && t.progress != null ? ' ' + t.progress + '%' : ''} · ${time}</span></div>` +
+        (t.detail ? `<div class="task-detail">${esc(t.detail)}</div>` : '') + bar + '</div>';
+    }).join('');
+  }
+
   loadState();
   setInterval(loadState, 5000);
+  loadTasks();
+  setInterval(loadTasks, 2000);
 </script>
 </body>
 </html>

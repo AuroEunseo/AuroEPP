@@ -42,9 +42,13 @@ class Agent(Base):
     # 재부팅 명령 전달 후 재연결 확인 (since: 명령 전달 시각, until: 확인 기한)
     reconnect_watch_since = Column(Float, nullable=True)
     reconnect_watch_until = Column(Float, nullable=True)
+    # 설치된 프로그램 목록 ('프로그램 추가/제거' 기준, 설치 여부 확인용) [{name, version, publisher}]
+    software_json = Column(Text, default="[]", server_default="[]")
+    software_ts = Column(Float, nullable=True)
 
     commands = relationship("AgentCommand", back_populates="agent", cascade="all, delete-orphan")
     reg_changes = relationship("RegistryChange", back_populates="agent", cascade="all, delete-orphan")
+    deployments = relationship("PackageDeployment", back_populates="agent", cascade="all, delete-orphan")
 
 
 class AgentCommand(Base):
@@ -86,6 +90,53 @@ class RegistryChange(Base):
     rollback_msg = Column(String(256), default="", server_default="")
 
     agent = relationship("Agent", back_populates="reg_changes")
+
+
+class SoftwarePackage(Base):
+    """사내 공용 프로그램 (업로드한 설치 파일 + 무인 설치 정보)"""
+    __tablename__ = "software_packages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(128), nullable=False)
+    version = Column(String(64), default="")
+    publisher = Column(String(128), default="")
+    filename = Column(String(256), nullable=False)
+    stored_name = Column(String(128), nullable=False)  # 서버 보관 파일명 (packages/ 아래)
+    size = Column(Integer, default=0)
+    sha256 = Column(String(64), nullable=False)
+    kind = Column(String(8), default="exe")  # msi | exe
+    install_args = Column(String(512), default="")  # MSI: 추가 속성, EXE: 무인 설치 옵션
+    uninstall_cmd = Column(String(1024), default="")  # 비우면 '프로그램 추가/제거' 정보로 자동 제거
+    detect_name = Column(String(256), default="")  # 설치 여부 확인용 표시 이름(부분 일치)
+    timeout_min = Column(Integer, default=30)
+    notes = Column(Text, default="")
+    created_by = Column(String(64), default="")
+    created_at = Column(Float, default=time.time)
+    updated_at = Column(Float, default=time.time)
+
+    deployments = relationship("PackageDeployment", back_populates="package", cascade="all, delete-orphan")
+
+
+class PackageDeployment(Base):
+    """프로그램 설치/삭제 요청 1건 (PC 1대 기준) 의 진행 상태"""
+    __tablename__ = "package_deployments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    package_id = Column(Integer, ForeignKey("software_packages.id", ondelete="CASCADE"), index=True)
+    machine_id = Column(String(64), ForeignKey("agents.machine_id", ondelete="CASCADE"), index=True)
+    action = Column(String(16), default="install")  # install | uninstall
+    # queued(PC 꺼짐·대기) | sent(전달됨) | downloading | installing | uninstalling | success | failed | cancelled
+    status = Column(String(16), default="queued", index=True)
+    progress = Column(Integer, default=0)
+    exit_code = Column(Integer, nullable=True)
+    message = Column(String(512), default="")
+    command_id = Column(Integer, nullable=True)  # 아직 전달 전이면 대기열 명령 ID (취소용)
+    requested_by = Column(String(64), default="")
+    created_at = Column(Float, default=time.time, index=True)
+    updated_at = Column(Float, default=time.time)
+
+    package = relationship("SoftwarePackage", back_populates="deployments")
+    agent = relationship("Agent", back_populates="deployments")
 
 
 class Policy(Base):
