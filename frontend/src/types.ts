@@ -177,3 +177,15 @@ export interface Presence {
   notification_count: number;
   online_sec: number;
 }
+
+/** 좌측 메뉴 키 */
+export type MenuKey =
+  | 'dashboard'
+  | 'pcs-managed'
+  | 'pcs-pending'
+  | 'pcs-rejected'
+  | 'notifications'
+  | 'policy-registry'
+  | 'policy-rules'
+  | 'logs'
+  | 'settings';

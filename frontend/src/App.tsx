@@ -1,17 +1,10 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import {
-  LayoutDashboard,
-  Monitor,
-  Shield,
   Terminal,
-  Settings,
-  ChevronDown,
-  ChevronRight,
   CheckCircle2,
   XCircle,
   ShieldCheck,
   KeyRound,
-  Bell,
   RefreshCw,
   Download,
   RotateCcw,
@@ -28,8 +21,8 @@ import {
   ArrowUpRight,
   Power,
 } from 'lucide-react';
-import { DashboardState, Agent, Presence } from './types';
-import { apiFetch, clearSession, errorMessage, getSessionToken, getSessionUser } from './api';
+import { Agent, MenuKey } from './types';
+import { apiFetch, errorMessage } from './api';
 import { AgentDrawer } from './components/AgentDrawer';
 import { LoginScreen } from './components/LoginScreen';
 import { StartupLoading } from './components/StartupLoading';
@@ -38,155 +31,46 @@ import { RejectedPcs } from './components/RejectedPcs';
 import { AccessLogPanel } from './components/AccessLogPanel';
 import { PasswordChangeForm } from './components/PasswordChangeForm';
 import { AccountManager } from './components/AccountManager';
-import logoUrl from './assets/ac1.png';
+import { THEMES } from './constants/themes';
+import { REGISTRY_BLOCKS, PolicyBlockDef } from './constants/registryBlocks';
+import { formatLastSeen } from './utils/format';
+import { useToast } from './hooks/useToast';
+import { useTheme } from './hooks/useTheme';
+import { useAuthFlow } from './hooks/useAuthFlow';
+import { useDashboardData } from './hooks/useDashboardData';
+import { useAutoStart } from './hooks/useAutoStart';
+import { ConsoleProvider } from './context/ConsoleContext';
+import { Sidebar } from './layout/Sidebar';
+import { Toast } from './layout/Toast';
 
-type MenuKey =
-  | 'dashboard'
-  | 'pcs-managed'
-  | 'pcs-pending'
-  | 'pcs-rejected'
-  | 'notifications'
-  | 'policy-registry'
-  | 'policy-rules'
-  | 'logs'
-  | 'settings';
-type ThemeKey = 'dark' | 'white' | 'lightblue' | 'pink' | 'ivory';
 type SortField = 'hostname' | 'os_name' | 'last_seen' | 'ring' | 'pend';
 
-const THEMES: { key: ThemeKey; label: string; bg: string; fg: string; accent: string }[] = [
-  { key: 'dark', label: '다크 (Dark)', bg: '#090e1a', fg: '#f8fafc', accent: '#38bdf8' },
-  { key: 'white', label: '화이트 (White)', bg: '#ffffff', fg: '#0f172a', accent: '#0284c7' },
-  { key: 'lightblue', label: '라이트블루 (Sky)', bg: '#e0f0fe', fg: '#0c2442', accent: '#0284c7' },
-  { key: 'pink', label: '핑크 (Blossom)', bg: '#fce7f3', fg: '#3b0d26', accent: '#db2777' },
-  { key: 'ivory', label: '아이보리 (Warm)', bg: '#f4efe4', fg: '#292218', accent: '#b45309' },
-];
-
-const WU = 'SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate';
-
-interface PolicyBlockDef {
-  id: string;
-  title: string;
-  desc: string;
-  path: string;
-  name: string;
-  type: 'DWORD' | 'SZ';
-  enabledValue: number | string;
-  disabledValue: number | string;
-  hasParam?: 'days' | 'version';
-  paramName?: string;
-}
-
-const REGISTRY_BLOCKS: PolicyBlockDef[] = [
-  {
-    id: 'defer_quality',
-    title: '품질(보안) 업데이트 설치 지연',
-    desc: '정기 보안 패치 배포 시 지정한 일수만큼 설치를 유예하여 초기 패치 오류로부터 사내 PC를 보호합니다.',
-    path: WU,
-    name: 'DeferQualityUpdates',
-    type: 'DWORD',
-    enabledValue: 1,
-    disabledValue: 0,
-    hasParam: 'days',
-    paramName: 'DeferQualityUpdatesPeriodInDays',
-  },
-  {
-    id: 'target_version',
-    title: 'Windows 기능 업데이트 버전 고정',
-    desc: '상위 메이저 OS 버전으로 자동 업그레이드되는 것을 차단하고 지정된 빌드(예: 25H2)로 고정합니다. 지원 종료된 버전에 고정하면 보안 업데이트를 받지 못합니다.',
-    path: WU,
-    name: 'TargetReleaseVersion',
-    type: 'DWORD',
-    enabledValue: 1,
-    disabledValue: 0,
-    hasParam: 'version',
-    paramName: 'TargetReleaseVersionInfo',
-  },
-  {
-    id: 'exclude_drivers',
-    title: 'Windows 업데이트를 통한 드라이버 자동 설치 차단',
-    desc: '그래픽·네트워크 등 하드웨어 드라이버가 임의로 덮어씌워져 장비 호환성 문제가 생기는 것을 방지합니다.',
-    path: WU,
-    name: 'ExcludeWUDriversInQualityUpdate',
-    type: 'DWORD',
-    enabledValue: 1,
-    disabledValue: 0,
-  },
-  {
-    id: 'no_auto_reboot',
-    title: '사용자 로그인 중 강제 자동 재부팅 방지',
-    desc: '업데이트 설치가 완료되더라도 사용자가 작업 중일 때는 PC가 임의로 재부팅되지 않도록 보호합니다.',
-    path: WU + '\\AU',
-    name: 'NoAutoRebootWithLoggedOnUsers',
-    type: 'DWORD',
-    enabledValue: 1,
-    disabledValue: 0,
-  },
-  {
-    id: 'disable_os_upgrade',
-    title: 'Windows 11 업그레이드 제안 및 자동 전환 차단',
-    desc: 'Windows 10 환경에서 상위 OS 업그레이드 안내 및 자동 전환 프로세스를 차단합니다.',
-    path: WU,
-    name: 'DisableOSUpgrade',
-    type: 'DWORD',
-    enabledValue: 1,
-    disabledValue: 0,
-  },
-  {
-    id: 'no_auto_update',
-    title: 'Windows 기본 자동 업데이트 스케줄러 비활성화',
-    desc: 'OS 자체 스케줄러 대신 중앙 관제 콘솔의 명령과 배포 그룹 일정에 의해서만 업데이트가 수행되도록 통제합니다.',
-    path: WU + '\\AU',
-    name: 'NoAutoUpdate',
-    type: 'DWORD',
-    enabledValue: 1,
-    disabledValue: 0,
-  },
-];
-
-function formatLastSeen(ts: number): string {
-  if (!ts || ts <= 0) return '접속 기록 없음';
-  const d = new Date(ts * 1000);
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
-}
-
 export default function App() {
-  // 로그인 → 로딩(DB 백업/마이그레이션 진행 표시) → 준비 완료
-  const [phase, setPhase] = useState<'login' | 'loading' | 'ready'>(() => (getSessionToken() ? 'loading' : 'login'));
-  const [username, setUsername] = useState(getSessionUser());
-  const [role, setRole] = useState<'admin' | 'operator' | ''>('');
+  const { toastMsg, showToast } = useToast();
+  const { theme, setTheme } = useTheme();
+  const auth = useAuthFlow();
+  const { phase, username, role, forcePwChange, goLogin, logout } = auth;
+  const { state, lastRefreshed, activeAgent, setActiveAgent, fetchState } = useDashboardData(phase, auth.handleApiError);
+  const { autoStart, toggleAutoStart } = useAutoStart(showToast);
   const [scanBusy, setScanBusy] = useState(false);
-  const lastRevRef = useRef('');
-  const lastFullFetchRef = useRef(0);
-  const [forcePwChange, setForcePwChange] = useState(false);
-  const [state, setState] = useState<DashboardState | null>(null);
 
-  // 테마 상태
-  const [theme, setTheme] = useState<ThemeKey>(
-    () => (localStorage.getItem('aurora_theme') as ThemeKey) || 'dark'
-  );
-
-  // 시작프로그램 옵션 상태
-  const [autoStart, setAutoStart] = useState<boolean>(
-    () => localStorage.getItem('aurora_autostart') === 'true'
-  );
-
-  // 좌측 내비게이션
+  // 좌측 내비게이션 (메뉴 그룹 펼침 상태는 Sidebar 가 관리)
   const [activeMenu, setActiveMenu] = useState<MenuKey>('dashboard');
-  const [pcMenuOpen, setPcMenuOpen] = useState(true);
-  const [policyMenuOpen, setPolicyMenuOpen] = useState(true);
+  const navigate = setActiveMenu;
+
+  // 로그아웃·세션 만료 후 다시 로그인하면 이전 사용자가 보던 메뉴가 아니라 대시보드부터 보여준다
+  useEffect(() => {
+    if (phase === 'login') {
+      setActiveMenu('dashboard');
+      setSelectedIds(new Set());
+    }
+  }, [phase]);
 
   // PC 관리 (검색, 정렬, 선택, 드로어)
   const [pcSearch, setPcSearch] = useState('');
   const [sortField, setSortField] = useState<SortField>('hostname');
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [activeAgent, setActiveAgent] = useState<Agent | null>(null);
 
   // 레지스트리 정책 및 배포 그룹(링) 상태
   const [ringTab, setRingTab] = useState('ring0');
@@ -202,111 +86,6 @@ export default function App() {
 
   // 로그 검색 상태
   const [logSearch, setLogSearch] = useState('');
-  const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
-  const [toastMsg, setToastMsg] = useState<string | null>(null);
-
-const showToast = (msg: string) => {
-  setToastMsg(msg);
-  setTimeout(() => setToastMsg(null), 3500);
-};
-
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('aurora_theme', theme);
-  }, [theme]);
-
-  const goLogin = useCallback(() => {
-    clearSession();
-    setState(null);
-    setActiveAgent(null);
-    setForcePwChange(false);
-    setPhase('login');
-  }, []);
-
-  const logout = async () => {
-    try {
-      await apiFetch('/auth/logout', {});
-    } catch {
-      /* 세션이 이미 만료된 경우 무시 */
-    }
-    goLogin();
-  };
-
-  const fetchState = useCallback(async () => {
-    if (!getSessionToken()) return;
-    try {
-      const data = await apiFetch<DashboardState>('/state');
-      setState(data);
-      setLastRefreshed(new Date());
-      setActiveAgent((prev) =>
-        prev ? data.agents.find((a) => a.machine_id === prev.machine_id) || null : null
-      );
-    } catch (e: any) {
-      if (e.message === 'UNAUTHORIZED') goLogin();
-      else if (e.message === 'PASSWORD_CHANGE_REQUIRED') {
-        setForcePwChange(true);
-        setPhase('login');
-      } else if (e.message === 'NOT_READY') setPhase('loading');
-    }
-  }, [goLogin]);
-
-  // 상태 갱신 방식
-  //  - 10초마다 /presence (가벼운 응답): PC 온라인/오프라인 표시와 알림 수만 갱신
-  //  - 서버 데이터가 바뀌었을 때(rev 변경) 또는 5분이 지났을 때만 전체 상태(/state)를 다시 받음
-  //  - 사용자가 명령·설정을 바꾸면 각 동작에서 fetchState()로 즉시 갱신
-  const FULL_REFRESH_MS = 5 * 60 * 1000;
-  const pollPresence = useCallback(async () => {
-    if (!getSessionToken()) return;
-    try {
-      const p = await apiFetch<Presence>('/presence');
-      const stale = Date.now() - lastFullFetchRef.current > FULL_REFRESH_MS;
-      if (p.rev !== lastRevRef.current || stale) {
-        lastRevRef.current = p.rev;
-        lastFullFetchRef.current = Date.now();
-        await fetchState();
-        return;
-      }
-      const applyPresence = (a: Agent): Agent => {
-        const ls = p.last_seen[a.machine_id];
-        return ls === undefined ? a : { ...a, last_seen: ls, online: p.now - ls < p.online_sec };
-      };
-      setState((prev) =>
-        prev
-          ? {
-              ...prev,
-              now: p.now,
-              notification_count: p.notification_count,
-              agents: prev.agents.map(applyPresence),
-              pending_agents: prev.pending_agents.map((a) => ({ ...applyPresence(a), alive: p.now - (p.last_seen[a.machine_id] ?? 0) < (prev.limits?.pending_alive_sec ?? 45) })),
-              rejected_agents: prev.rejected_agents.map((a) => ({ ...applyPresence(a), alive: p.now - (p.last_seen[a.machine_id] ?? 0) < (prev.limits?.pending_alive_sec ?? 45) })),
-            }
-          : prev
-      );
-      setActiveAgent((prev) => (prev ? applyPresence(prev) : prev));
-    } catch (e: any) {
-      if (e.message === 'UNAUTHORIZED') goLogin();
-      else if (e.message === 'PASSWORD_CHANGE_REQUIRED') {
-        setForcePwChange(true);
-        setPhase('login');
-      } else if (e.message === 'NOT_READY') setPhase('loading');
-    }
-  }, [fetchState, goLogin]);
-
-  useEffect(() => {
-    if (phase !== 'ready') return;
-    lastRevRef.current = '';
-    pollPresence();
-    const id = setInterval(pollPresence, 10000);
-    return () => clearInterval(id);
-  }, [pollPresence, phase]);
-
-  // 로그인 계정의 권한 (관리자만 계정 관리 메뉴 표시)
-  useEffect(() => {
-    if (phase !== 'ready') return;
-    apiFetch<{ role: 'admin' | 'operator' }>('/auth/me')
-      .then((m) => setRole(m.role))
-      .catch(() => setRole(''));
-  }, [phase, username]);
 
   // [업데이트 다시 검색]: 업데이트 검색만 요청 (설치·규칙 적용 없음). 선택한 PC가 없으면 온라인 PC 전체
   const requestScan = async () => {
@@ -326,24 +105,12 @@ const showToast = (msg: string) => {
     }
   };
 
-  const onStartupReady = useCallback(() => setPhase('ready'), []);
-
   useEffect(() => {
     if (state && state.policies[ringTab] && loadedRing !== ringTab) {
       setDraftItems(JSON.parse(JSON.stringify(state.policies[ringTab].items || [])));
       setLoadedRing(ringTab);
     }
   }, [state, ringTab, loadedRing]);
-
-  const navigateToMenu = (menu: MenuKey) => {
-    if (menu === 'pcs-managed' || menu === 'pcs-pending' || menu === 'pcs-rejected') {
-      setPcMenuOpen(true);
-    }
-    if (menu === 'policy-registry' || menu === 'policy-rules') {
-      setPolicyMenuOpen(true);
-    }
-    setActiveMenu(menu);
-  };
 
   // PC 목록 검색 + 정렬
   const processedAgents = useMemo(() => {
@@ -380,54 +147,18 @@ const showToast = (msg: string) => {
     }
   };
 
-  // Electron 콘솔(preload의 consoleApi)에서 실제 Windows 로그인 항목 상태를 읽어와 동기화
-  useEffect(() => {
-    const ipc = (window as any).consoleApi;
-    if (!ipc?.getPrefs) return;
-    ipc
-      .getPrefs()
-      .then((p: { openAtLogin: boolean }) => {
-        setAutoStart(Boolean(p?.openAtLogin));
-        localStorage.setItem('aurora_autostart', String(Boolean(p?.openAtLogin)));
-      })
-      .catch(() => {});
-  }, []);
-
-  const toggleAutoStart = async (checked: boolean) => {
-    const ipc = (window as any).consoleApi;
-    if (!ipc?.setAutoStart) {
-      setAutoStart(checked);
-      localStorage.setItem('aurora_autostart', String(checked));
-      showToast('브라우저에서는 자동 시작을 설정할 수 없습니다. AURORA Endpoint Control Console 앱에서 설정하세요.');
-      return;
-    }
-    try {
-      const res = await ipc.setAutoStart(checked);
-      const applied = Boolean(res?.openAtLogin);
-      setAutoStart(applied);
-      localStorage.setItem('aurora_autostart', String(applied));
-      showToast(applied ? '✓ Windows 로그인 시 자동 시작이 설정되었습니다.' : '✓ 자동 시작이 해제되었습니다.');
-    } catch (e: any) {
-      showToast(`자동 시작 설정 실패: ${e?.message || e}`);
-    }
-  };
-
   if (phase === 'login') {
     return (
       <LoginScreen
         forcePasswordChange={forcePwChange}
         usernameHint={username || undefined}
-        onLoggedIn={(u) => {
-          setUsername(u);
-          setForcePwChange(false);
-          setPhase('loading');
-        }}
+        onLoggedIn={auth.onLoggedIn}
       />
     );
   }
 
   if (phase === 'loading') {
-    return <StartupLoading onReady={onStartupReady} onUnauthorized={goLogin} />;
+    return <StartupLoading onReady={auth.onStartupReady} onUnauthorized={goLogin} />;
   }
 
   if (!state) {
@@ -604,193 +335,27 @@ const showToast = (msg: string) => {
     return ev.host.toLowerCase().includes(q) || ev.msg.toLowerCase().includes(q);
   });
 
-  const isPcMenuActive = activeMenu === 'pcs-managed' || activeMenu === 'pcs-pending' || activeMenu === 'pcs-rejected';
+  
+  const consoleValue = {
+    state,
+    fetchState,
+    lastRefreshed,
+    showToast,
+    openAgent: setActiveAgent,
+    activeMenu,
+    navigate,
+    username,
+    role,
+    logout,
+    theme,
+    setTheme,
+  };
 
   return (
+    <ConsoleProvider value={consoleValue}>
     <div className="app-layout">
-      {toastMsg && (
-  <div
-    style={{
-      position: 'fixed',
-      top: 18,
-      right: 24,
-      zIndex: 9999,
-      background: 'var(--accent-primary, #0284c7)',
-      color: '#ffffff',
-      padding: '10px 18px',
-      borderRadius: 8,
-      fontWeight: 600,
-      fontSize: 13,
-      boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
-    }}
-  >
-    {toastMsg}
-  </div>
-)}
-      {/* 좌측 고정 사이드바 메뉴 */}
-      <aside className="sidebar">
-        <div className="brand-group">
-          <img src={logoUrl} className="brand-logo brand-logo-img" alt="AURORA" />
-          <div>
-            <h1 className="brand-title">Endpoint Control</h1>
-            <p className="brand-sub">오로라 관제 콘솔</p>
-          </div>
-        </div>
-
-        <nav className="nav-section">
-          <button
-            className={`nav-item ${activeMenu === 'dashboard' ? 'active' : ''}`}
-            onClick={() => navigateToMenu('dashboard')}
-          >
-            <span className="nav-item-left">
-              <LayoutDashboard size={16} />
-              <span>대시보드 요약</span>
-            </span>
-          </button>
-
-          {/* PC 관리 + 하위 메뉴 (관리중 PC / 승인 대기 PC) */}
-          <div>
-            <button
-              className={`nav-item ${isPcMenuActive ? 'active' : ''}`}
-              onClick={() => {
-                setPcMenuOpen((o) => !o);
-                if (!isPcMenuActive) {
-                  setActiveMenu(pending.length > 0 ? 'pcs-pending' : 'pcs-managed');
-                }
-              }}
-            >
-              <span className="nav-item-left">
-                <Monitor size={16} />
-                <span>PC 관리</span>
-              </span>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                {pending.length > 0 && <span className="badge-count">+{pending.length}</span>}
-                {pcMenuOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-              </span>
-            </button>
-
-            {pcMenuOpen && (
-              <div className="nav-sub-group">
-                <button
-                  className={`nav-sub-item ${activeMenu === 'pcs-managed' ? 'active' : ''}`}
-                  onClick={() => setActiveMenu('pcs-managed')}
-                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                >
-                  <span>관리중 PC</span>
-                  <span className="mono" style={{ fontSize: 11, opacity: 0.8 }}>
-                    {agents.length}
-                  </span>
-                </button>
-                <button
-                  className={`nav-sub-item ${activeMenu === 'pcs-pending' ? 'active' : ''}`}
-                  onClick={() => setActiveMenu('pcs-pending')}
-                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                >
-                  <span>승인 대기 PC</span>
-                  {pending.length > 0 ? (
-                    <span className="badge-count" style={{ fontSize: 10, padding: '1px 6px' }}>
-                      {pending.length}
-                    </span>
-                  ) : (
-                    <span className="mono" style={{ fontSize: 11, opacity: 0.6 }}>
-                      0
-                    </span>
-                  )}
-                </button>
-                <button
-                  className={`nav-sub-item ${activeMenu === 'pcs-rejected' ? 'active' : ''}`}
-                  onClick={() => setActiveMenu('pcs-rejected')}
-                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                >
-                  <span>거부 PC</span>
-                  <span className="mono" style={{ fontSize: 11, opacity: 0.6 }}>
-                    {rejected.length}
-                  </span>
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* 레지스트리 정책 확인 + 하위 메뉴 */}
-          <div>
-            <button
-              className={`nav-item ${
-                activeMenu === 'policy-registry' || activeMenu === 'policy-rules' ? 'active' : ''
-              }`}
-              onClick={() => {
-                setPolicyMenuOpen((o) => !o);
-                if (activeMenu !== 'policy-registry' && activeMenu !== 'policy-rules') {
-                  setActiveMenu('policy-registry');
-                }
-              }}
-            >
-              <span className="nav-item-left">
-                <Shield size={16} />
-                <span>레지스트리 정책 확인</span>
-              </span>
-              {policyMenuOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-            </button>
-
-            {policyMenuOpen && (
-              <div className="nav-sub-group">
-                <button
-                  className={`nav-sub-item ${activeMenu === 'policy-registry' ? 'active' : ''}`}
-                  onClick={() => setActiveMenu('policy-registry')}
-                >
-                  레지스트리 정책 관리
-                </button>
-                <button
-                  className={`nav-sub-item ${activeMenu === 'policy-rules' ? 'active' : ''}`}
-                  onClick={() => setActiveMenu('policy-rules')}
-                >
-                  Windows 업데이트 규칙
-                </button>
-              </div>
-            )}
-          </div>
-
-          <button
-            className={`nav-item ${activeMenu === 'notifications' ? 'active' : ''}`}
-            onClick={() => navigateToMenu('notifications')}
-          >
-            <span className="nav-item-left">
-              <Bell size={16} />
-              <span>알림</span>
-            </span>
-            {notifCount > 0 && <span className="badge-count">{notifCount}</span>}
-          </button>
-
-          <button
-            className={`nav-item ${activeMenu === 'logs' ? 'active' : ''}`}
-            onClick={() => navigateToMenu('logs')}
-          >
-            <span className="nav-item-left">
-              <Terminal size={16} />
-              <span>로그 관리</span>
-            </span>
-          </button>
-
-          <button
-            className={`nav-item ${activeMenu === 'settings' ? 'active' : ''}`}
-            onClick={() => navigateToMenu('settings')}
-          >
-            <span className="nav-item-left">
-              <Settings size={16} />
-              <span>설정</span>
-            </span>
-          </button>
-        </nav>
-
-        <div className="sidebar-footer">
-          <div style={{ color: '#10b981', fontWeight: 600 }}>● 관제 서버 정상 가동 중</div>
-          <div style={{ marginTop: 4, fontSize: 11 }}>
-            접속 계정: {username || '-'} · 포트 {state.server?.port ?? '-'}
-          </div>
-          <div style={{ marginTop: 4, fontSize: 11 }}>
-            테마: {THEMES.find((t) => t.key === theme)?.label}
-          </div>
-        </div>
-      </aside>
+      <Toast message={toastMsg} />
+      <Sidebar />
 
       {/* 우측 페이지 본문 */}
       <main className="content-area">
@@ -815,7 +380,7 @@ const showToast = (msg: string) => {
             <div className="kpi-grid">
               <div
                 className="glass-card kpi-card"
-                onClick={() => navigateToMenu('policy-registry')}
+                onClick={() => navigate('policy-registry')}
                 style={{ cursor: 'pointer' }}
                 title="레지스트리 정책 관리로 이동"
               >
@@ -831,7 +396,7 @@ const showToast = (msg: string) => {
 
               <div
                 className="glass-card kpi-card"
-                onClick={() => navigateToMenu('pcs-managed')}
+                onClick={() => navigate('pcs-managed')}
                 style={{ cursor: 'pointer' }}
                 title="관리중 PC 목록으로 바로가기"
               >
@@ -848,7 +413,7 @@ const showToast = (msg: string) => {
 
               <div
                 className="glass-card kpi-card"
-                onClick={() => navigateToMenu('pcs-pending')}
+                onClick={() => navigate('pcs-pending')}
                 style={{ cursor: 'pointer' }}
                 title="승인 대기 PC 목록으로 바로가기"
               >
@@ -864,7 +429,7 @@ const showToast = (msg: string) => {
 
               <div
                 className="glass-card kpi-card"
-                onClick={() => navigateToMenu('pcs-managed')}
+                onClick={() => navigate('pcs-managed')}
                 style={{ cursor: 'pointer' }}
                 title="관리중 PC 목록으로 이동"
               >
@@ -887,7 +452,7 @@ const showToast = (msg: string) => {
                     <span>신규 에이전트 등록 요청 ({pending.length}대) — 즉시 승인 가능</span>
                   </div>
                   <button
-                    onClick={() => navigateToMenu('pcs-pending')}
+                    onClick={() => navigate('pcs-pending')}
                     className="btn btn-ghost"
                     style={{ fontSize: 12 }}
                   >
@@ -941,7 +506,7 @@ const showToast = (msg: string) => {
                   <Terminal size={16} style={{ color: 'var(--accent-text)' }} />
                   <span>실시간 관제 요약 로그 (최근 80건 · 30초 자동 갱신)</span>
                 </h3>
-                <button onClick={() => navigateToMenu('logs')} className="btn btn-ghost">
+                <button onClick={() => navigate('logs')} className="btn btn-ghost">
                   전체 로그 검색 보기 →
                 </button>
               </div>
@@ -975,7 +540,7 @@ const showToast = (msg: string) => {
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                 {pending.length > 0 && (
                   <button
-                    onClick={() => navigateToMenu('pcs-pending')}
+                    onClick={() => navigate('pcs-pending')}
                     className="btn btn-amber"
                   >
                     <ShieldCheck size={13} /> 승인 대기 PC ({pending.length}대)
@@ -1179,7 +744,7 @@ const showToast = (msg: string) => {
                 </p>
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
-                <button onClick={() => navigateToMenu('pcs-managed')} className="btn btn-ghost">
+                <button onClick={() => navigate('pcs-managed')} className="btn btn-ghost">
                   관리중 PC ({agents.length}대) 보기 →
                 </button>
                 <button onClick={fetchState} className="btn btn-ghost">
@@ -1808,5 +1373,6 @@ const showToast = (msg: string) => {
         onRefresh={fetchState}
       />
     </div>
+    </ConsoleProvider>
   );
 }
