@@ -1,0 +1,8 @@
+{
+  "name": "aurora-ui-smoke",
+  "private": true,
+  "description": "콘솔 화면 스모크 테스트 (Playwright)",
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}

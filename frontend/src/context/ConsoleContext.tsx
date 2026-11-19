@@ -15,6 +15,8 @@ export interface ConsoleContextValue {
   openAgent: (agent: Agent | null) => void;
   activeMenu: MenuKey;
   navigate: (menu: MenuKey) => void;
+  /** 화면 이탈 확인 함수 등록 (false 를 반환하면 메뉴 이동 취소). 해제는 null */
+  setLeaveGuard: (guard: (() => boolean) | null) => void;
   username: string;
   role: Role;
   logout: () => Promise<void>;

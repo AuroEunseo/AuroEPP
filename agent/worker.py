@@ -26,7 +26,7 @@ from wua_engine import (
     enforce_updates,
 )
 
-AGENT_VER = "1.0.2"
+AGENT_VER = "1.0.3"  # electron-agent/package.json 의 version 과 맞춰 관리
 CHECKIN_INTERVAL = 20
 # Windows Update 검색은 무거운 작업(CPU·네트워크)이라 주기적으로 하지 않는다.
 # 검색 시점: ① 콘솔이 요청할 때(콘솔 첫 접속 시 자동 1회, [업데이트 다시 검색] 버튼, PC별 [즉시 스캔])
