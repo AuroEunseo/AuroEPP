@@ -15,7 +15,6 @@
       "main.js",
       "preload.js",
       "index.html",
-      "store.html",
       "package.json"
     ],
     "appId": "com.aurora.control.agent",

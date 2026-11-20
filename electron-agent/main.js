@@ -24,7 +24,7 @@ const STARTUP_ARG = '--minimized';
 const START_MINIMIZED = [STARTUP_ARG, '--tray', '--hidden'].some((a) => process.argv.includes(a));
 
 let mainWindow = null;
-let storeWindow = null;
+let balloonShown = false; // 창 닫기 안내 풍선은 실행 후 한 번만
 let tray = null;
 let isQuitting = false;
 
@@ -242,7 +242,7 @@ function sendShutdownLogToServer() {
     const targetUrl = new URL('/api/agent/shutdown', baseUrl);
     const body = JSON.stringify({
       machine_id: identity.machine_id,
-      reason: '에이전트 트레이 메뉴에서 완전 종료 실행',
+      reason: '에이전트 트레이 메뉴에서 프로그램 종료 실행',
     });
 
     const client = targetUrl.protocol === 'https:' ? https : http;
@@ -286,14 +286,17 @@ async function performFullShutdown() {
   });
 }
 
-function showStatusWindow() {
+// 화면: home(메인) | store(프로그램 설치) | server(서버 연결 관리)
+const VIEWS = ['home', 'store', 'server'];
+
+function showWindow(view = 'home') {
+  const v = VIEWS.includes(view) ? view : 'home';
   if (!mainWindow || mainWindow.isDestroyed()) {
-    createStatusWindow(false);
+    createMainWindow(false, v);
     return;
   }
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
-  }
+  mainWindow.webContents.send('navigate', v);
+  if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
 }
@@ -311,6 +314,14 @@ ipcMain.handle('get-tasks', () => readTasks().tasks);
 ipcMain.handle('save-config', async (_event, { ip, port }) => {
   writeServerConfig(ip, port);
   return await restartAgentService();
+});
+
+ipcMain.handle('open-log', () => {
+  if (fs.existsSync(AGENT_LOG_FILE)) {
+    shell.openPath(AGENT_LOG_FILE);
+    return true;
+  }
+  return false;
 });
 
 ipcMain.handle('restart-service', async () => {
@@ -402,35 +413,6 @@ ipcMain.handle('catalog-request', async (_e, { id }) => {
   return { ok: true, ...r.json };
 });
 
-ipcMain.handle('open-store', () => showStoreWindow());
-
-function showStoreWindow() {
-  if (storeWindow && !storeWindow.isDestroyed()) {
-    if (storeWindow.isMinimized()) storeWindow.restore();
-    storeWindow.show();
-    storeWindow.focus();
-    return;
-  }
-  storeWindow = new BrowserWindow({
-    width: 760,
-    height: 720,
-    minWidth: 560,
-    minHeight: 480,
-    autoHideMenuBar: true,
-    backgroundColor: '#090d16',
-    title: '프로그램 설치 센터',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-  storeWindow.on('closed', () => {
-    storeWindow = null;
-  });
-  storeWindow.loadFile(path.join(__dirname, 'store.html'));
-}
-
 // ------------------------------------------------------------------
 // 작업 현황 (서비스가 기록하는 tasks.json → 트레이 메뉴 '진행 중인 작업' / 설정 창)
 // ------------------------------------------------------------------
@@ -449,59 +431,38 @@ function taskLabel(t) {
   return `${t.title} — ${state}${pct}`;
 }
 
+async function confirmQuit() {
+  const parent = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : null;
+  const opts = {
+    type: 'warning',
+    buttons: ['종료', '취소'],
+    defaultId: 1,
+    cancelId: 1,
+    title: `${APP_TITLE} 종료`,
+    message: '에이전트와 백그라운드 서비스를 종료할까요?',
+    detail: '종료하면 관제 서버에 종료 기록이 남고, 다시 실행할 때까지 원격 업데이트·프로그램 설치가 중단됩니다.',
+  };
+  const res = parent ? await dialog.showMessageBox(parent, opts) : await dialog.showMessageBox(opts);
+  if (res.response === 0) await performFullShutdown();
+}
+
+// 트레이 메뉴: 처리 중인 작업 → 창 열기 버튼 2개 → 종료
 function buildTrayMenu(tasks) {
   const active = tasks.filter((t) => !t.finished);
-  const recent = tasks.filter((t) => t.finished).slice(-5).reverse();
+  const head = active.length
+    ? [
+        { label: `처리 중인 작업 ${active.length}건`, enabled: false },
+        ...active.slice(0, 6).map((t) => ({ label: `   ${taskLabel(t)}`, enabled: false })),
+        ...(active.length > 6 ? [{ label: `   외 ${active.length - 6}건`, enabled: false }] : []),
+      ]
+    : [{ label: '처리 중인 작업 없음', enabled: false }];
   return Menu.buildFromTemplate([
-    {
-      label: active.length ? `진행 중인 작업 (${active.length})` : '진행 중인 작업 없음',
-      enabled: active.length > 0,
-      submenu: active.length ? active.map((t) => ({ label: taskLabel(t), enabled: false })) : undefined,
-    },
-    {
-      label: '최근 완료된 작업',
-      enabled: recent.length > 0,
-      submenu: recent.length
-        ? recent.map((t) => ({ label: `${t.ok ? '✔' : '✖'} ${t.title} (${new Date(t.finished * 1000).toLocaleTimeString('ko-KR')})`, enabled: false }))
-        : undefined,
-    },
+    ...head,
     { type: 'separator' },
-    {
-      label: '프로그램 설치 센터 열기',
-      click: () => showStoreWindow(),
-    },
-    {
-      label: '에이전트 설정 및 작업 현황 열기',
-      click: () => showStatusWindow(),
-    },
-    {
-      label: '백그라운드 서비스 재시작 (서버 재연결)',
-      click: () => restartAgentService(),
-    },
-    {
-      label: '연결 진단 로그 열기',
-      click: () => {
-        if (fs.existsSync(AGENT_LOG_FILE)) shell.openPath(AGENT_LOG_FILE);
-        else dialog.showMessageBox({ type: 'info', message: '아직 기록된 로그가 없습니다.', detail: AGENT_LOG_FILE });
-      },
-    },
+    { label: '프로그램 설치 창 열기', click: () => showWindow('store') },
+    { label: '서버 연결 관리 열기', click: () => showWindow('server') },
     { type: 'separator' },
-    {
-      label: '완전 종료 (서버에 종료 로그 전송)',
-      click: async () => {
-        const res = await dialog.showMessageBox(mainWindow, {
-          type: 'warning',
-          buttons: ['완전 종료', '취소'],
-          defaultId: 1,
-          title: `${APP_TITLE} 완전 종료`,
-          message: '에이전트와 백그라운드 업데이트 서비스를 완전히 종료하시겠습니까?',
-          detail: '종료 시 중앙 관제 서버에 종료 로그가 기록되며 원격 업데이트 제어가 중단됩니다.',
-        });
-        if (res.response === 0) {
-          await performFullShutdown();
-        }
-      },
-    },
+    { label: '프로그램 종료', click: () => confirmQuit() },
   ]);
 }
 
@@ -540,21 +501,23 @@ function createTray() {
   tray = new Tray(icon);
   tray.setToolTip(`${APP_TITLE} (백그라운드 상시 실행 중)`);
   tray.setContextMenu(buildTrayMenu([]));
-  tray.on('click', () => showStatusWindow());
-  tray.on('double-click', () => showStatusWindow());
+  // 왼쪽 클릭도 메뉴를 바로 띄운다 (처리 중 작업 확인 + 창 열기), 더블클릭은 메인 화면
+  tray.on('click', () => tray.popUpContextMenu());
+  tray.on('double-click', () => showWindow('home'));
   refreshTasks();
   setInterval(refreshTasks, 2000);
 }
 
-function createStatusWindow(startHidden = false) {
+function createMainWindow(startHidden = false, view = 'home') {
   mainWindow = new BrowserWindow({
-    width: 540,
-    height: 760,
+    width: 820,
+    height: 640,
+    minWidth: 680,
+    minHeight: 540,
     show: !startHidden,
-    resizable: false,
     autoHideMenuBar: true,
     backgroundColor: '#090d16',
-    title: `${APP_TITLE} 설정`,
+    title: APP_TITLE,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -566,16 +529,17 @@ function createStatusWindow(startHidden = false) {
     if (!isQuitting) {
       e.preventDefault();
       mainWindow.hide();
-      if (tray) {
+      if (tray && !balloonShown) {
+        balloonShown = true;
         tray.displayBalloon({
           title: APP_TITLE,
-          content: '백그라운드 트레이에서 계속 실행 중입니다. 완전히 종료하려면 트레이 아이콘을 우클릭하세요.',
+          content: '트레이에서 계속 실행 중입니다. 트레이 아이콘을 누르면 처리 중인 작업과 메뉴가 보입니다.',
         });
       }
     }
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+  mainWindow.loadFile(path.join(__dirname, 'index.html'), { hash: view });
 }
 
 const gotLock = app.requestSingleInstanceLock();
@@ -583,12 +547,12 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    showStatusWindow();
+    showWindow('home');
   });
 
   app.whenReady().then(() => {
     ensureBootPersistenceAndReconnect();
     createTray();
-    createStatusWindow(START_MINIMIZED);
+    createMainWindow(START_MINIMIZED, 'home');
   });
 }
