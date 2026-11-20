@@ -1487,7 +1487,9 @@ def serve_spa(full_path: str):
     if STATIC_DIR:
         index_file = os.path.join(STATIC_DIR, "index.html")
         if os.path.exists(index_file):
-            return FileResponse(index_file)
+            # 화면 업데이트 후 예전 화면이 캐시에서 열리지 않도록 index.html 은 매번 서버에 확인
+            # (assets/ 의 JS·CSS 는 파일명에 해시가 붙어 있어 캐시해도 안전)
+            return FileResponse(index_file, headers={"Cache-Control": "no-cache"})
     return {
         "error": "static 폴더(index.html)를 찾지 못했습니다.",
         "meipass": getattr(sys, "_MEIPASS", None),

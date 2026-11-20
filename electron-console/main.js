@@ -208,6 +208,8 @@ async function createWindow() {
 
   try {
     await waitForServer(`http://127.0.0.1:${PORT}/api/health`);
+    // 새 버전 설치 후에도 이전 화면이 캐시에서 열리는 문제 방지 (화면 파일은 로컬 서버라 다시 받아도 빠름)
+    await mainWindow.webContents.session.clearCache().catch(() => {});
     // 로그인은 아이디/비밀번호로 진행 (관리자 토큰 자동 주입 제거)
     await mainWindow.loadURL(`http://127.0.0.1:${PORT}`);
   } catch (e) {

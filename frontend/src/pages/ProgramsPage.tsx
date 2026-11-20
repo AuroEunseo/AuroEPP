@@ -181,6 +181,19 @@ export const ProgramsPage: React.FC = () => {
     }
   };
 
+  /** 목록에서 바로 설치 센터 공개/비공개 전환 */
+  const toggleSelf = async (p: SoftwarePackage) => {
+    const next = !p.self_service;
+    if (next && !confirm(`'${p.name} ${p.version}' 을(를) 에이전트 '프로그램 설치 센터'에 공개할까요?\n모든 승인 PC 사용자가 직접 설치할 수 있습니다. (승인 방식: ${p.self_approval ? '관리자 승인 후 설치' : '누르면 바로 설치'} — [수정]에서 변경)`)) return;
+    try {
+      await apiFetch(`/packages/${p.id}`, { ...metaFromPackage(p), self_service: next }, 'PUT');
+      showToast(next ? '✓ 설치 센터에 공개했습니다.' : '설치 센터에서 숨겼습니다.');
+      loadList();
+    } catch (e) {
+      alert(errorMessage(e));
+    }
+  };
+
   const deletePackage = async (p: SoftwarePackage) => {
     if (!confirm(`'${p.name} ${p.version}' 프로그램을 삭제할까요?\n서버의 설치 파일과 배포 기록이 지워지고, 아직 전달되지 않은 설치 요청도 취소됩니다.\n(이미 PC에 설치된 프로그램은 그대로 남습니다)`)) return;
     try {
@@ -425,6 +438,7 @@ export const ProgramsPage: React.FC = () => {
                   <th>프로그램</th>
                   <th>형식 · 크기</th>
                   <th>무인 옵션</th>
+                  <th>설치 센터</th>
                   <th>설치된 PC</th>
                   <th>진행 중 / 실패</th>
                   <th>등록</th>
@@ -443,11 +457,6 @@ export const ProgramsPage: React.FC = () => {
                         <PackageIcon id={p.id} name={p.name} hasIcon={p.has_icon} rev={p.icon_rev} />
                         <div>
                           <strong>{p.name}</strong> <span style={{ color: 'var(--text-secondary)' }}>{p.version}</span>
-                          {p.self_service && (
-                            <span className="badge badge-ok" style={{ marginLeft: 6, fontSize: 10 }}>
-                              설치 센터{p.self_approval ? ' · 승인 필요' : ''}
-                            </span>
-                          )}
                           <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.filename}</div>
                         </div>
                       </div>
@@ -457,6 +466,19 @@ export const ProgramsPage: React.FC = () => {
                     </td>
                     <td className="mono" style={{ fontSize: 11.5, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p.install_args}>
                       {p.kind === 'msi' ? `/qn ${p.install_args}` : p.install_args || '-'}
+                    </td>
+                    <td onClick={(e) => e.stopPropagation()} style={{ whiteSpace: 'nowrap' }}>
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: isAdmin ? 'pointer' : 'default' }}
+                        title={isAdmin ? '에이전트 프로그램 설치 화면에 공개' : '관리자만 변경할 수 있습니다'}
+                      >
+                        <input type="checkbox" checked={p.self_service} disabled={!isAdmin} onChange={() => toggleSelf(p)} />
+                        {p.self_service ? (
+                          <span style={{ color: '#34d399' }}>공개{p.self_approval ? ' · 승인 필요' : ''}</span>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)' }}>비공개</span>
+                        )}
+                      </label>
                     </td>
                     <td className="mono">{p.installed_count ?? 0}대</td>
                     <td className="mono">
