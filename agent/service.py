@@ -132,6 +132,12 @@ class AuroraAgentService(win32serviceutil.ServiceFramework):
     def SvcDoRun(self):
         log.info("Windows 서비스 시작")
         ensure_service_recovery()
+        try:
+            import acl
+
+            acl.harden_data_dir()  # 데이터 폴더를 SYSTEM·Administrators 전용으로 (설치 파일 바꿔치기 방지)
+        except Exception as e:  # noqa: BLE001
+            log.warning("데이터 폴더 권한 점검 실패: %s", e)
         servicemanager.LogMsg(
             servicemanager.EVENTLOG_INFORMATION_TYPE,
             servicemanager.PYS_SERVICE_STARTED,

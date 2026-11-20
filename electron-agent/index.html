@@ -96,7 +96,10 @@
   </div>
 
   <div class="card">
-    <div class="card-title">작업 현황 (관제 서버가 요청한 설치·업데이트 작업)</div>
+    <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+      <span>작업 현황 (관제 서버가 요청한 설치·업데이트 작업)</span>
+      <button class="btn-sub" onclick="window.agentApi.openStore()">프로그램 설치 센터</button>
+    </div>
     <div id="taskList" class="tasks"><div class="task-empty">진행 중인 작업이 없습니다.</div></div>
   </div>
 

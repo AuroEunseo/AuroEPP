@@ -9,7 +9,13 @@ export const isActiveDeployment = (d?: Deployment | null) => !!d && ACTIVE.inclu
 export const DeploymentBadge: React.FC<{ d: Deployment | null }> = ({ d }) => {
   if (!d) return <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>-</span>;
   const cls =
-    d.status === 'success' ? 'badge-ok' : d.status === 'failed' ? 'badge-danger' : d.status === 'cancelled' ? '' : 'badge-warn';
+    d.status === 'success'
+      ? 'badge-ok'
+      : d.status === 'failed' || d.status === 'rejected'
+        ? 'badge-danger'
+        : d.status === 'cancelled'
+          ? ''
+          : 'badge-warn';
   const verb = d.action === 'install' ? '설치' : '삭제';
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 140 }}>

@@ -1,6 +1,6 @@
 {
   "name": "aurora-agent",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "AURORA Endpoint Agent",
   "main": "main.js",
   "scripts": {
@@ -15,6 +15,7 @@
       "main.js",
       "preload.js",
       "index.html",
+      "store.html",
       "package.json"
     ],
     "appId": "com.aurora.control.agent",

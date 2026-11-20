@@ -28,7 +28,7 @@ from wua_engine import (
     enforce_updates,
 )
 
-AGENT_VER = "1.0.3"  # electron-agent/package.json 의 version 과 맞춰 관리
+AGENT_VER = "1.0.4"  # electron-agent/package.json 의 version 과 맞춰 관리
 CHECKIN_INTERVAL = 20
 # Windows Update 검색은 무거운 작업(CPU·네트워크)이라 주기적으로 하지 않는다.
 # 검색 시점: ① 콘솔이 요청할 때(콘솔 첫 접속 시 자동 1회, [업데이트 다시 검색] 버튼, PC별 [즉시 스캔])
@@ -93,6 +93,14 @@ class AgentWorker:
         self.ident: dict | None = None
         self.software_dirty = True  # 설치 프로그램 목록을 다음 체크인 때 보고할지
         self.pending_progress: list[dict] = []  # 전송 실패한 배포 결과 (다음 체크인 전에 재전송)
+        # 서비스 시작 시 데이터 폴더 권한 점검에서 발견한 경고 → 첫 체크인 때 콘솔 알림으로 보고
+        try:
+            import acl
+
+            for w in acl.LAST_WARNINGS:
+                self.cmd_results.append({"type": "security_check", "ok": False, "out": w[:250]})
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # 레지스트리 변경 이력 (로컬 보관 + 서버 보고)
@@ -343,12 +351,16 @@ class AgentWorker:
                 code, note = pkg_engine.uninstall(body)
 
             # 설치 여부 확인: '프로그램 추가/제거' 목록에서 다시 찾아본다
-            found = pkg_engine.find_installed(body.get("detect_name") or body["name"])
+            found = pkg_engine.find_installed(body.get("detect_name") or body["name"], include_system_profile=True)
+            if action == "install" and found and found.get("scope") == "system_profile":
+                raise pkg_engine.PackageError(pkg_engine.SYSTEM_PROFILE_HINT, exit_code=code)
             if action == "install":
                 check = f"설치 확인됨 ({found['name']} {found['version']})" if found else \
                     "설치 프로그램은 정상 종료했지만 '프로그램 추가/제거' 목록에서 찾지 못함 (확인용 이름 점검 필요)"
             else:
                 check = "삭제 확인됨" if not found else f"삭제 후에도 목록에 남아 있음 ({found['name']})"
+                if found and found.get("scope") == "system_profile":
+                    check += " — SYSTEM 계정 전용 설치 항목"
             msg = " · ".join(x for x in (note, check) if x)
             self._report_progress(did, "success", 100, msg, code)
             self.tasks.finish(tid, True, msg)
@@ -372,6 +384,7 @@ class AgentWorker:
             body = pkg_engine.verify_command(cpayload, (self.ident or {}).get("machine_id", ""))
             if f"pkg_{body['action']}" != ctype or body["deployment_id"] != did:
                 raise pkg_engine.PackageError("명령 종류와 서명된 내용이 일치하지 않음")
+            pkg_engine.check_and_mark_fresh(body)
         except pkg_engine.PackageError as e:
             log.warning("프로그램 배포 명령 거부: %s", e)
             if did:

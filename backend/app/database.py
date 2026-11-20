@@ -90,6 +90,8 @@ def secure_data_dir() -> str:
     if not is_elevated():
         # 관리자 권한이 아니면 권한을 바꾸지 않는다 (바꾸면 이후 이 프로세스가 파일을 못 열게 됨)
         return "서버가 관리자 권한 없이 실행되어 데이터 폴더 보안 설정을 건너뛰었습니다."
+    # 일반 사용자가 폴더를 먼저 만들어 둔 경우 소유자 권한(권한 재설정 가능)이 남지 않도록 소유자부터 변경
+    _icacls(BASE_DIR, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q")
     _icacls(BASE_DIR, "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/C", "/Q")
     _icacls(BASE_DIR, "/inheritance:r", "/C", "/Q")
     _icacls(os.path.join(BASE_DIR, "*"), "/reset", "/T", "/C", "/Q")

@@ -24,4 +24,10 @@ backend/*.db-*
 backend/backups/
 bak/*.db
 *.patch
-patch/bak/
+patch/
+bak/
+
+# --- 빌드 산출물 (build.bat 실행 시 매번 새로 생성됨) ---
+build/Aurora*/
+electron-agent/resources/AuroraAgentEngine/
+electron-console/resources/AuroraServerEngine/

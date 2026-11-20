@@ -34,7 +34,8 @@ from sqlalchemy.orm import Session
 from .database import BASE_DIR, get_db
 from .keystore import load_or_create
 from .models import Agent, AgentCommand, PackageDeployment, SoftwarePackage
-from .schemas import DeployRequest, PackageCreateRequest, PackageUpdateRequest, ProgressReport
+from .schemas import (DeployRequest, PackageCreateRequest, PackageUpdateRequest, ProgressReport, RejectRequest,
+                      SelfInstallRequest)
 from .security import require_admin_role, require_ready, verify_admin, verify_agent
 from .settings import DEPLOY_KEEP_DAYS, PACKAGE_MAX_BYTES
 
@@ -42,9 +43,18 @@ PACKAGE_DIR = os.path.join(BASE_DIR, "packages")
 UPLOAD_DIR = os.path.join(PACKAGE_DIR, "_uploads")
 SIGNING_KEY_FILE = os.path.join(BASE_DIR, "signing.key")
 ALLOWED_EXT = {".msi": "msi", ".exe": "exe"}
-ACTIVE_STATES = ("queued", "sent", "downloading", "installing", "uninstalling")
-TERMINAL_STATES = ("success", "failed", "cancelled")
+ICON_DIR = os.path.join(PACKAGE_DIR, "icons")
+ICON_MAX_BYTES = 128 * 1024
+ICON_TYPES = {b"\x89PNG\r\n\x1a\n": ("png", "image/png"), b"\x00\x00\x01\x00": ("ico", "image/x-icon")}
+ACTIVE_STATES = ("queued", "sent", "downloading", "installing", "uninstalling")  # 설치 파일 다운로드 허용 상태
+BUSY_STATES = ACTIVE_STATES + ("requested",)  # 같은 PC·프로그램에 새 요청을 받지 않는 상태
+TERMINAL_STATES = ("success", "failed", "cancelled", "rejected")
+SELF_PREFIX = "셀프 설치"
+SELF_RATE_PER_HOUR = 20  # PC 1대가 1시간에 보낼 수 있는 셀프 설치 요청 수
+# 설치 센터(요청한 PC 자신)에 보여줄 이름: 요청한 PC는 켜져 있으므로 'PC 꺼짐' 대신 준비 중으로 표시
+SELF_LABEL = {"queued": "설치 준비 중", "sent": "설치 준비 중"}
 STATUS_LABEL = {
+    "requested": "승인 대기", "rejected": "거절됨",
     "queued": "대기 (PC 꺼짐)", "sent": "전달됨", "downloading": "다운로드 중", "installing": "설치 중",
     "uninstalling": "삭제 중", "success": "완료", "failed": "실패", "cancelled": "취소됨",
 }
@@ -185,12 +195,15 @@ def _serialize_pkg(p: SoftwarePackage, agents: list[Agent] | None = None) -> dic
         "size": p.size, "sha256": p.sha256, "kind": p.kind, "install_args": p.install_args,
         "uninstall_cmd": p.uninstall_cmd, "detect_name": p.detect_name, "timeout_min": p.timeout_min,
         "notes": p.notes, "created_by": p.created_by, "created_at": p.created_at, "updated_at": p.updated_at,
+        "description": p.description or "", "self_service": bool(p.self_service), "self_approval": bool(p.self_approval),
+        "has_icon": bool(p.icon_type), "icon_rev": p.icon_rev or 0,
     }
     if agents is not None:
         latest = _latest_deployments(p)
         d["installed_count"] = sum(1 for a in agents if detect(p, _software(a))[0])
         d["active_count"] = sum(1 for dep in latest.values() if dep.status in ACTIVE_STATES)
         d["failed_count"] = sum(1 for dep in latest.values() if dep.status == "failed")
+        d["requested_count"] = sum(1 for dep in latest.values() if dep.status == "requested")
     return d
 
 
@@ -208,6 +221,7 @@ def _serialize_dep(d: PackageDeployment) -> dict:
         "exit_code": d.exit_code, "message": d.message, "requested_by": d.requested_by,
         "created_at": d.created_at, "updated_at": d.updated_at,
         "package_name": d.package.name if d.package else "", "package_version": d.package.version if d.package else "",
+        "hostname": d.agent.hostname if d.agent else "",
     }
 
 
@@ -260,7 +274,8 @@ def create_package(req: PackageCreateRequest, db: Session = Depends(get_db),
         filename=up["filename"], stored_name=stored, size=up["size"], sha256=up["sha256"], kind=up["kind"],
         install_args=req.install_args.strip()[:512], uninstall_cmd=req.uninstall_cmd.strip()[:1024],
         detect_name=(req.detect_name.strip() or req.name.strip())[:256], timeout_min=int(req.timeout_min),
-        notes=req.notes[:2000], created_by=actor["username"], created_at=now, updated_at=now,
+        notes=req.notes[:2000], description=req.description.strip()[:500], self_service=bool(req.self_service),
+        self_approval=bool(req.self_approval), created_by=actor["username"], created_at=now, updated_at=now,
     )
     db.add(p)
     _main().log_event(db, "console", f"프로그램 등록: {p.name} {p.version} ({p.filename}, {p.size:,} bytes) by {actor['username']}")
@@ -281,6 +296,9 @@ def update_package(pid: int, req: PackageUpdateRequest, db: Session = Depends(ge
     p.detect_name = (req.detect_name.strip() or p.name)[:256]
     p.timeout_min = int(req.timeout_min)
     p.notes = req.notes[:2000]
+    p.description = req.description.strip()[:500]
+    p.self_service = bool(req.self_service)
+    p.self_approval = bool(req.self_approval)
     p.updated_at = time.time()
     _main().log_event(db, "console", f"프로그램 정보 수정: {p.name} {p.version} by {actor['username']}")
     db.commit()
@@ -298,11 +316,14 @@ def delete_package(pid: int, db: Session = Depends(get_db), actor: dict = Depend
     path = os.path.join(PACKAGE_DIR, p.stored_name)
     db.delete(p)
     _main().log_event(db, "console", f"프로그램 삭제: {name} by {actor['username']}")
+    icon = _icon_path(p)
     db.commit()
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    for f in (path, icon):
+        try:
+            if f:
+                os.remove(f)
+        except OSError:
+            pass
     return {"ok": True}
 
 
@@ -324,6 +345,26 @@ def package_status(pid: int, db: Session = Depends(get_db)):
     return {"package": _serialize_pkg(p), "rows": rows}
 
 
+def _issue(db: Session, p: SoftwarePackage, dep: PackageDeployment, now: float) -> None:
+    """배포 기록에 서명된 설치/삭제 명령을 붙여 대기열에 넣는다 (관리자 배포·셀프 설치·승인 공용)"""
+    body = {
+        "v": 1, "deployment_id": dep.id, "package_id": p.id, "machine_id": dep.machine_id, "action": dep.action,
+        "name": p.name, "version": p.version, "kind": p.kind, "filename": p.filename, "sha256": p.sha256,
+        "size": p.size, "install_args": p.install_args, "uninstall_cmd": p.uninstall_cmd,
+        "detect_name": p.detect_name, "timeout_min": p.timeout_min, "issued_at": now,
+    }
+    payload = {"deployment_id": dep.id, **sign_payload(body)}
+    cmd = AgentCommand(machine_id=dep.machine_id, cmd_type=f"pkg_{dep.action}",
+                       payload_json=json.dumps(payload, ensure_ascii=False), created_at=now)
+    db.add(cmd)
+    db.flush()
+    dep.status, dep.command_id, dep.updated_at = "queued", cmd.id, now
+
+
+def _file_ok(p: SoftwarePackage) -> bool:
+    return os.path.exists(os.path.join(PACKAGE_DIR, p.stored_name))
+
+
 @router.post("/api/packages/{pid}/deploy", dependencies=ADMIN_DEPS)
 def deploy_package(pid: int, req: DeployRequest, db: Session = Depends(get_db),
                    actor: dict = Depends(verify_admin)):
@@ -332,7 +373,7 @@ def deploy_package(pid: int, req: DeployRequest, db: Session = Depends(get_db),
     if req.action not in ("install", "uninstall"):
         raise HTTPException(status_code=400, detail="지원하지 않는 작업입니다.")
     p = _get_pkg(db, pid)
-    if not os.path.exists(os.path.join(PACKAGE_DIR, p.stored_name)):
+    if not _file_ok(p):
         raise HTTPException(status_code=410, detail="서버에 설치 파일이 없습니다. 다시 업로드하세요.")
     sent, queued, skipped, notify_ids = [], [], [], []
     now = time.time()
@@ -343,28 +384,22 @@ def deploy_package(pid: int, req: DeployRequest, db: Session = Depends(get_db),
         busy = (
             db.query(PackageDeployment)
             .filter(PackageDeployment.package_id == p.id, PackageDeployment.machine_id == mid,
-                    PackageDeployment.status.in_(ACTIVE_STATES))
+                    PackageDeployment.status.in_(BUSY_STATES))
             .first()
         )
-        if busy:
+        if busy and busy.status == "requested" and req.action == "install":
+            # 승인 대기 중인 셀프 설치 요청이 있으면 그 요청을 승인한 것으로 처리
+            dep = busy
+            dep.message = f"{actor['username']} 님이 배포하며 승인"
+        elif busy:
             skipped.append(a.hostname)
             continue
-        dep = PackageDeployment(package_id=p.id, machine_id=mid, action=req.action, status="queued",
-                                requested_by=actor["username"], created_at=now, updated_at=now)
-        db.add(dep)
-        db.flush()
-        body = {
-            "v": 1, "deployment_id": dep.id, "package_id": p.id, "machine_id": mid, "action": req.action,
-            "name": p.name, "version": p.version, "kind": p.kind, "filename": p.filename, "sha256": p.sha256,
-            "size": p.size, "install_args": p.install_args, "uninstall_cmd": p.uninstall_cmd,
-            "detect_name": p.detect_name, "timeout_min": p.timeout_min, "issued_at": now,
-        }
-        payload = {"deployment_id": dep.id, **sign_payload(body)}
-        cmd = AgentCommand(machine_id=mid, cmd_type=f"pkg_{req.action}",
-                           payload_json=json.dumps(payload, ensure_ascii=False), created_at=now)
-        db.add(cmd)
-        db.flush()
-        dep.command_id = cmd.id
+        else:
+            dep = PackageDeployment(package_id=p.id, machine_id=mid, action=req.action, status="queued",
+                                    requested_by=actor["username"], created_at=now, updated_at=now)
+            db.add(dep)
+            db.flush()
+        _issue(db, p, dep, now)
         if m.is_online(a):
             sent.append(a.hostname)
             notify_ids.append(mid)
@@ -398,6 +433,128 @@ def cancel_deployment(did: int, db: Session = Depends(get_db), actor: dict = Dep
 
 
 # ==========================================================
+# 아이콘 (PNG/ICO, 128KB 이하)
+# ==========================================================
+def _icon_path(p: SoftwarePackage) -> str:
+    return os.path.join(ICON_DIR, f"{p.id}.{p.icon_type}") if p.icon_type else ""
+
+
+def _icon_response(p: SoftwarePackage) -> FileResponse:
+    path = _icon_path(p)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="아이콘이 없습니다.")
+    media = "image/png" if p.icon_type == "png" else "image/x-icon"
+    return FileResponse(path, media_type=media, headers={
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400",
+        "Content-Security-Policy": "default-src 'none'",
+    })
+
+
+@router.post("/api/packages/{pid}/icon", dependencies=[Depends(require_ready)])
+async def upload_icon(pid: int, request: Request, db: Session = Depends(get_db),
+                      actor: dict = Depends(require_admin_role)):
+    p = _get_pkg(db, pid)
+    data = b""
+    async for chunk in request.stream():
+        data += chunk
+        if len(data) > ICON_MAX_BYTES:
+            raise HTTPException(status_code=413, detail=f"아이콘은 {ICON_MAX_BYTES // 1024}KB 이하만 올릴 수 있습니다.")
+    kind = next((v[0] for magic, v in ICON_TYPES.items() if data.startswith(magic)), None)
+    if not kind:
+        raise HTTPException(status_code=400, detail="아이콘은 PNG 또는 ICO 파일만 올릴 수 있습니다.")
+    os.makedirs(ICON_DIR, exist_ok=True)
+    old = _icon_path(p)
+    p.icon_type = kind
+    p.icon_rev = (p.icon_rev or 0) + 1
+    new = _icon_path(p)
+    with open(new + ".tmp", "wb") as f:
+        f.write(data)
+    os.replace(new + ".tmp", new)
+    if old and old != new:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    p.updated_at = time.time()
+    db.commit()
+    return {"ok": True, "icon_rev": p.icon_rev}
+
+
+@router.delete("/api/packages/{pid}/icon", dependencies=[Depends(require_ready)])
+def delete_icon(pid: int, db: Session = Depends(get_db), actor: dict = Depends(require_admin_role)):
+    p = _get_pkg(db, pid)
+    old = _icon_path(p)
+    p.icon_type, p.icon_rev = "", (p.icon_rev or 0) + 1
+    db.commit()
+    try:
+        if old:
+            os.remove(old)
+    except OSError:
+        pass
+    return {"ok": True}
+
+
+@router.get("/api/packages/{pid}/icon", dependencies=ADMIN_DEPS)
+def get_icon(pid: int, db: Session = Depends(get_db)):
+    return _icon_response(_get_pkg(db, pid))
+
+
+# ==========================================================
+# 셀프 설치 요청 승인/거절 (콘솔)
+# ==========================================================
+@router.get("/api/package-requests", dependencies=ADMIN_DEPS)
+def list_requests(db: Session = Depends(get_db)):
+    rows = (
+        db.query(PackageDeployment)
+        .filter(PackageDeployment.status == "requested")
+        .order_by(PackageDeployment.id)
+        .all()
+    )
+    return {"requests": [_serialize_dep(d) for d in rows]}
+
+
+def _get_request(db: Session, did: int) -> PackageDeployment:
+    d = db.query(PackageDeployment).filter(PackageDeployment.id == did).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="요청을 찾을 수 없습니다.")
+    if d.status != "requested":
+        raise HTTPException(status_code=409, detail="이미 처리된 요청입니다.")
+    return d
+
+
+@router.post("/api/deployments/{did}/approve", dependencies=ADMIN_DEPS)
+def approve_request(did: int, db: Session = Depends(get_db), actor: dict = Depends(verify_admin)):
+    m = _main()
+    d = _get_request(db, did)
+    if not d.package or not _file_ok(d.package):
+        raise HTTPException(status_code=410, detail="서버에 설치 파일이 없습니다.")
+    now = time.time()
+    _issue(db, d.package, d, now)
+    d.message = f"{actor['username']} 님이 승인"
+    host = d.agent.hostname if d.agent else d.machine_id
+    m.log_event(db, "console", f"셀프 설치 승인: {d.package.name} {d.package.version} → {host} (by {actor['username']})")
+    online = bool(d.agent and m.is_online(d.agent))
+    db.commit()
+    if online:
+        m.notify_agent_realtime(d.machine_id, "command")
+    return {"ok": True, "online": online}
+
+
+@router.post("/api/deployments/{did}/reject", dependencies=ADMIN_DEPS)
+def reject_request(did: int, req: RejectRequest, db: Session = Depends(get_db), actor: dict = Depends(verify_admin)):
+    m = _main()
+    d = _get_request(db, did)
+    reason = (req.reason or "").strip()[:200]
+    d.status, d.updated_at = "rejected", time.time()
+    d.message = f"{actor['username']} 님이 거절" + (f": {reason}" if reason else "")
+    host = d.agent.hostname if d.agent else d.machine_id
+    name = f"{d.package.name} {d.package.version}" if d.package else f"#{d.package_id}"
+    m.log_event(db, "console", f"셀프 설치 거절: {name} → {host} (by {actor['username']}) {reason}")
+    db.commit()
+    return {"ok": True}
+
+
+# ==========================================================
 # 에이전트 API
 # ==========================================================
 @router.get("/api/agent/packages/{pid}/file", dependencies=[Depends(require_ready)])
@@ -416,6 +573,112 @@ def download_package(pid: int, agent: Agent = Depends(verify_agent), db: Session
     if not os.path.exists(path):
         raise HTTPException(status_code=410, detail="서버에 설치 파일이 없습니다.")
     return FileResponse(path, media_type="application/octet-stream", filename=p.filename)
+
+
+def _ver_tuple(v: str) -> tuple:
+    nums = [int(x) for x in re.findall(r"\d+", v or "")][:4]
+    while nums and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums)
+
+
+def _self_pkg(db: Session, pid: int) -> SoftwarePackage:
+    p = db.query(SoftwarePackage).filter(SoftwarePackage.id == pid, SoftwarePackage.self_service.is_(True)).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="설치 센터에 공개되지 않은 프로그램입니다.")
+    return p
+
+
+@router.get("/api/agent/catalog", dependencies=[Depends(require_ready)])
+def agent_catalog(agent: Agent = Depends(verify_agent), db: Session = Depends(get_db)):
+    """에이전트 '프로그램 설치 센터' 목록: 공개된 프로그램 + 이 PC 설치 여부 + 진행 상태"""
+    if agent.status != "active":
+        raise HTTPException(status_code=403, detail="콘솔에서 승인된 PC만 사용할 수 있습니다.")
+    software = _software(agent)
+    items = []
+    pkgs = (
+        db.query(SoftwarePackage)
+        .filter(SoftwarePackage.self_service.is_(True))
+        .order_by(SoftwarePackage.name, SoftwarePackage.id.desc())
+        .all()
+    )
+    for p in pkgs:
+        installed, ver = detect(p, software)
+        state = "none"
+        if installed:
+            state = "update" if ver and p.version and _ver_tuple(ver) < _ver_tuple(p.version) else "installed"
+        dep = (
+            db.query(PackageDeployment)
+            .filter(PackageDeployment.package_id == p.id, PackageDeployment.machine_id == agent.machine_id)
+            .order_by(PackageDeployment.id.desc())
+            .first()
+        )
+        items.append({
+            "id": p.id, "name": p.name, "version": p.version, "publisher": p.publisher,
+            "description": p.description or "", "size": p.size, "kind": p.kind,
+            "approval": bool(p.self_approval), "has_icon": bool(p.icon_type), "icon_rev": p.icon_rev or 0,
+            "state": state, "installed_version": ver,
+            "request": {
+                "id": dep.id, "action": dep.action, "status": dep.status,
+                "status_label": SELF_LABEL.get(dep.status) or STATUS_LABEL.get(dep.status, dep.status),
+                "progress": dep.progress, "message": dep.message, "updated_at": dep.updated_at,
+            } if dep else None,
+        })
+    return {"items": items, "software_ts": agent.software_ts}
+
+
+@router.get("/api/agent/catalog/{pid}/icon", dependencies=[Depends(require_ready)])
+def agent_catalog_icon(pid: int, agent: Agent = Depends(verify_agent), db: Session = Depends(get_db)):
+    return _icon_response(_self_pkg(db, pid))
+
+
+@router.post("/api/agent/catalog/{pid}/request", dependencies=[Depends(require_ready)])
+def agent_self_request(pid: int, req: SelfInstallRequest, agent: Agent = Depends(verify_agent),
+                       db: Session = Depends(get_db)):
+    """설치 센터의 [설치] 버튼. 명령은 항상 서버가 서명해서 만든다 (에이전트가 직접 설치를 결정하지 않음)"""
+    m = _main()
+    if agent.status != "active":
+        raise HTTPException(status_code=403, detail="콘솔에서 승인된 PC만 사용할 수 있습니다.")
+    p = _self_pkg(db, pid)
+    if not _file_ok(p):
+        raise HTTPException(status_code=410, detail="서버에 설치 파일이 없습니다. 관리자에게 문의하세요.")
+    busy = (
+        db.query(PackageDeployment)
+        .filter(PackageDeployment.package_id == p.id, PackageDeployment.machine_id == agent.machine_id,
+                PackageDeployment.status.in_(BUSY_STATES))
+        .first()
+    )
+    if busy:
+        return {"ok": True, "already": True, "status": busy.status, "status_label": STATUS_LABEL.get(busy.status, busy.status)}
+    now = time.time()
+    recent = (
+        db.query(PackageDeployment.id)
+        .filter(PackageDeployment.machine_id == agent.machine_id, PackageDeployment.created_at > now - 3600,
+                PackageDeployment.requested_by.like(f"{SELF_PREFIX}%"))
+        .count()
+    )
+    if recent >= SELF_RATE_PER_HOUR:
+        raise HTTPException(status_code=429, detail="요청이 너무 많습니다. 잠시 후 다시 시도하세요.")
+    user = re.sub(r"[^\w.\-\\@ ]", "", req.user or "")[:40]
+    who = f"{SELF_PREFIX}" + (f" ({user})" if user else "")
+    dep = PackageDeployment(package_id=p.id, machine_id=agent.machine_id, action="install", status="requested",
+                            requested_by=who[:64], created_at=now, updated_at=now)
+    db.add(dep)
+    db.flush()
+    name = f"{p.name} {p.version}".strip()
+    if p.self_approval:
+        dep.message = "관리자 승인을 기다리는 중"
+        m.notify_console(db, "warn", "deploy", f"셀프 설치 승인 요청: {agent.hostname}",
+                         f"{name} — {user or '사용자'} 님이 설치를 요청했습니다. [프로그램 관리]에서 승인하거나 거절하세요.",
+                         agent.machine_id)
+        m.log_event(db, agent.hostname, f"셀프 설치 요청 (승인 대기): {name} by {user or '-'}")
+        db.commit()
+        return {"ok": True, "status": "requested", "status_label": STATUS_LABEL["requested"]}
+    _issue(db, p, dep, now)
+    m.log_event(db, agent.hostname, f"셀프 설치 시작: {name} by {user or '-'}")
+    db.commit()
+    m.notify_agent_realtime(agent.machine_id, "command")
+    return {"ok": True, "status": "queued", "status_label": SELF_LABEL["queued"]}
 
 
 @router.post("/api/agent/progress", dependencies=[Depends(require_ready)])
@@ -494,6 +757,10 @@ def on_command_expired(db: Session, cmd: AgentCommand) -> None:
 
 def cleanup(db: Session) -> None:
     cutoff = time.time() - DEPLOY_KEEP_DAYS * 86400
+    # 보관 기간 동안 처리되지 않은 셀프 설치 요청은 자동 거절
+    for d in db.query(PackageDeployment).filter(PackageDeployment.status == "requested",
+                                                  PackageDeployment.created_at < cutoff).all():
+        d.status, d.updated_at, d.message = "rejected", time.time(), "승인 대기 기간이 지나 자동으로 닫힘"
     db.query(PackageDeployment).filter(
         PackageDeployment.updated_at < cutoff, PackageDeployment.status.in_(TERMINAL_STATES)
     ).delete(synchronize_session=False)

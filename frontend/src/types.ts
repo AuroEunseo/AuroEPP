@@ -213,6 +213,13 @@ export interface SoftwarePackage {
   installed_count?: number;
   active_count?: number;
   failed_count?: number;
+  requested_count?: number;
+  /** 에이전트 '프로그램 설치 센터' 공개 여부·설명·아이콘 */
+  description: string;
+  self_service: boolean;
+  self_approval: boolean;
+  has_icon: boolean;
+  icon_rev: number;
 }
 
 /** PC 1대에 대한 프로그램 설치/삭제 요청 */
@@ -221,7 +228,17 @@ export interface Deployment {
   package_id: number;
   machine_id: string;
   action: 'install' | 'uninstall';
-  status: 'queued' | 'sent' | 'downloading' | 'installing' | 'uninstalling' | 'success' | 'failed' | 'cancelled';
+  status:
+    | 'requested'
+    | 'queued'
+    | 'sent'
+    | 'downloading'
+    | 'installing'
+    | 'uninstalling'
+    | 'success'
+    | 'failed'
+    | 'cancelled'
+    | 'rejected';
   status_label: string;
   progress: number;
   exit_code: number | null;
@@ -231,6 +248,7 @@ export interface Deployment {
   updated_at: number;
   package_name: string;
   package_version: string;
+  hostname?: string;
 }
 
 export interface PackageStatusRow {

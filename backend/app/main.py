@@ -555,9 +555,10 @@ def _store_reg_changes(db: Session, agent: Agent, changes: list[dict]):
         ).delete(synchronize_session=False)
 
 
-RESULT_CATEGORY = {"policy": "policy", "reg_rollback": "rollback"}
+RESULT_CATEGORY = {"policy": "policy", "reg_rollback": "rollback", "security_check": "security"}
 RESULT_TITLE = {
     "policy": "정책 적용 실패",
+    "security_check": "에이전트 보안 점검 경고",
     "reg_rollback": "레지스트리 롤백",
     "update": "업데이트 작업 실패",
     "install_all": "업데이트 설치 실패",

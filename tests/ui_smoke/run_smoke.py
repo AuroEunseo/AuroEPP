@@ -87,8 +87,12 @@ def seed(srv_dir):
                                           "Content-Type": "application/octet-stream"})
     with urllib.request.urlopen(req, timeout=15) as r:
         up = json.loads(r.read())
-    call("/api/packages", {"upload_id": up["upload_id"], "name": "SampleTool", "version": "1.2.0",
-                           "install_args": "/S", "detect_name": "SampleTool"}, t)
+    pkg = call("/api/packages", {"upload_id": up["upload_id"], "name": "SampleTool", "version": "1.2.0",
+                                 "install_args": "/S", "detect_name": "SampleTool", "description": "합성 설명",
+                                 "self_service": True, "self_approval": True}, t)
+    # 설치 센터 승인 대기 요청 1건 (합성 PC SYN-2)
+    call(f"/api/agent/catalog/{pkg['id']}/request", {"user": "synthetic.user"},
+         headers={"X-Machine-ID": "SYN-2", "X-Agent-Token": "tok2" * 8})
     call("/api/auth/logout", {}, t)
     # 로그인 시 '콘솔 시작 검색'이 온라인 PC를 대상으로 하도록 마지막 통신 시각을 현재로
     c = sqlite3.connect(os.path.join(srv_dir, "aurora_enterprise.db"))

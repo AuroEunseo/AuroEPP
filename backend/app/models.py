@@ -110,6 +110,12 @@ class SoftwarePackage(Base):
     detect_name = Column(String(256), default="")  # 설치 여부 확인용 표시 이름(부분 일치)
     timeout_min = Column(Integer, default=30)
     notes = Column(Text, default="")
+    # 에이전트 '프로그램 설치 센터' (사용자 셀프 설치)
+    description = Column(String(500), default="")  # 설치 센터에 보이는 설명
+    self_service = Column(Boolean, default=False)  # 설치 센터에 공개
+    self_approval = Column(Boolean, default=False)  # True: 관리자 승인 후 설치 / False: 누르면 바로 설치
+    icon_type = Column(String(8), default="")  # png | ico ('' = 아이콘 없음)
+    icon_rev = Column(Integer, default=0)  # 아이콘 교체 시 증가 (화면 캐시 갱신용)
     created_by = Column(String(64), default="")
     created_at = Column(Float, default=time.time)
     updated_at = Column(Float, default=time.time)
@@ -125,7 +131,8 @@ class PackageDeployment(Base):
     package_id = Column(Integer, ForeignKey("software_packages.id", ondelete="CASCADE"), index=True)
     machine_id = Column(String(64), ForeignKey("agents.machine_id", ondelete="CASCADE"), index=True)
     action = Column(String(16), default="install")  # install | uninstall
-    # queued(PC 꺼짐·대기) | sent(전달됨) | downloading | installing | uninstalling | success | failed | cancelled
+    # requested(셀프 설치 승인 대기) | queued(PC 꺼짐·대기) | sent(전달됨) | downloading | installing | uninstalling
+    # | success | failed | cancelled | rejected(승인 거절)
     status = Column(String(16), default="queued", index=True)
     progress = Column(Integer, default=0)
     exit_code = Column(Integer, nullable=True)

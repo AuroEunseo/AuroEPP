@@ -31,7 +31,11 @@ if IS_WIN:
 PUBKEY_FILE = os.path.join(DATA_DIR, "server_signing.pub")
 CACHE_DIR = os.path.join(DATA_DIR, "packages")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
+SEEN_FILE = os.path.join(DATA_DIR, "pkg_seen.json")  # 이미 받은 배포 명령 (재전송 방지)
 CACHE_KEEP = 5  # 최근 설치 파일 캐시 보관 개수
+SEEN_KEEP = 1000
+CMD_MAX_AGE = 8 * 86400  # 서버 대기열 보관 기간(7일) + 여유 1일. 이보다 오래된 명령은 재전송으로 보고 거부
+SYSTEM_PROFILE_SID = "S-1-5-18"
 
 log = get_logger()
 
@@ -96,6 +100,35 @@ def verify_command(payload: dict, machine_id: str) -> dict:
     return body
 
 
+def _seen_key(body: dict) -> str:
+    return f"{body.get('deployment_id')}:{body.get('issued_at')}"
+
+
+def check_and_mark_fresh(body: dict) -> None:
+    """같은 명령을 다시 보내는 재전송 공격 방지: 오래된 명령·이미 받은 명령은 거부하고, 통과하면 기록"""
+    issued = float(body.get("issued_at") or 0)
+    if not issued or time.time() - issued > CMD_MAX_AGE:
+        raise PackageError("발행된 지 너무 오래된 명령이라 실행하지 않음 (재전송 의심)")
+    key = _seen_key(body)
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            seen = json.load(f)
+        if not isinstance(seen, list):
+            seen = []
+    except (OSError, ValueError):
+        seen = []
+    if key in seen:
+        raise PackageError("이미 받은 명령이 다시 들어와 실행하지 않음 (재전송 의심)")
+    seen = (seen + [key])[-SEEN_KEEP:]
+    tmp = SEEN_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(seen, f)
+        os.replace(tmp, SEEN_FILE)
+    except OSError as e:
+        log.warning("배포 명령 기록 저장 실패: %s", e)
+
+
 # ==========================================================
 # 설치된 프로그램 목록
 # ==========================================================
@@ -105,14 +138,23 @@ UNINSTALL_KEYS = (
 )
 
 
-def collect_software() -> list[dict]:
-    """[{name, version, publisher, uninstall, quiet_uninstall, product_code}] (시스템 구성요소 제외)"""
+def _uninstall_roots(include_system_profile: bool):
+    """(루트, 경로, 보기, 범위) — 범위 'machine' = PC 전체, 'system_profile' = SYSTEM 계정 전용 설치"""
+    for path, view in UNINSTALL_KEYS:
+        yield winreg.HKEY_LOCAL_MACHINE, path, view, "machine"
+    if include_system_profile:
+        # 사용자별(per-user) 설치 프로그램을 SYSTEM 권한으로 설치하면 SYSTEM 계정 영역에만 등록된다
+        yield winreg.HKEY_USERS, SYSTEM_PROFILE_SID + "\\" + UNINSTALL_KEYS[0][0], 0, "system_profile"
+
+
+def collect_software(include_system_profile: bool = False) -> list[dict]:
+    """[{name, version, publisher, uninstall, quiet_uninstall, product_code, scope}] (시스템 구성요소 제외)"""
     if not IS_WIN:
         return []
     out, seen = [], set()
-    for path, view in UNINSTALL_KEYS:
+    for hive, path, view, scope in _uninstall_roots(include_system_profile):
         try:
-            root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_READ | view)
+            root = winreg.OpenKey(hive, path, 0, winreg.KEY_READ | view)
         except OSError:
             continue
         with root:
@@ -134,14 +176,15 @@ def collect_software() -> list[dict]:
                         if not name or val("SystemComponent", 0) == 1 or val("ParentKeyName"):
                             continue
                         version = str(val("DisplayVersion")).strip()
-                        if (name, version) in seen:
+                        if (name, version, scope) in seen:
                             continue
-                        seen.add((name, version))
+                        seen.add((name, version, scope))
                         out.append({
                             "name": name, "version": version, "publisher": str(val("Publisher")).strip(),
                             "uninstall": str(val("UninstallString")).strip(),
                             "quiet_uninstall": str(val("QuietUninstallString")).strip(),
                             "product_code": sub if re.fullmatch(r"\{[0-9A-Fa-f-]{36}\}", sub) and val("WindowsInstaller", 0) == 1 else "",
+                            "scope": scope,
                         })
                 except OSError:
                     continue
@@ -154,11 +197,20 @@ def public_software(items: list[dict]) -> list[dict]:
     return [{"name": s["name"], "version": s["version"], "publisher": s["publisher"]} for s in items]
 
 
-def find_installed(detect_name: str) -> dict | None:
+def find_installed(detect_name: str, include_system_profile: bool = False) -> dict | None:
+    """PC 전체 설치를 먼저 찾고, 없으면 (요청 시) SYSTEM 계정 전용 설치도 찾는다"""
     key = (detect_name or "").strip().lower()
     if not key:
         return None
-    return next((s for s in collect_software() if key in s["name"].lower()), None)
+    items = [s for s in collect_software(include_system_profile) if key in s["name"].lower()]
+    return next((s for s in items if s["scope"] == "machine"), None) or (items[0] if items else None)
+
+
+SYSTEM_PROFILE_HINT = (
+    "PC 전체가 아니라 SYSTEM 계정 전용으로 설치되어 사용자에게 보이지 않습니다. "
+    "사용자별 설치 프로그램입니다 — 설치 인자에 '/allusers'(Electron·NSIS) 등 모든 사용자용 옵션을 추가하거나 "
+    "PC 전체 설치용 설치 파일을 사용하세요"
+)
 
 
 # ==========================================================
@@ -256,6 +308,9 @@ def install(path: str, body: dict) -> tuple[int, str]:
         cmd = f'msiexec.exe /i "{path}" /qn /norestart /l*v "{msi_log}" {args}'.strip()
     else:
         cmd = f'"{path}" {args}'.strip()
+    # 실행 직전에 한 번 더 확인 (다운로드·캐시 확인 이후 파일이 바뀌지 않았는지)
+    if not os.path.exists(path) or _sha256(path) != body["sha256"]:
+        raise PackageError("실행 직전 설치 파일 확인 실패 (SHA-256 불일치) — 실행하지 않음")
     code = _run(cmd, int(body.get("timeout_min") or 30))
     return code, _result(code, "install")
 
@@ -265,7 +320,7 @@ def uninstall(body: dict) -> tuple[int, str]:
     if (body.get("uninstall_cmd") or "").strip():
         code = _run(body["uninstall_cmd"].strip(), timeout)
         return code, _result(code, "uninstall")
-    entry = find_installed(body.get("detect_name") or body.get("name"))
+    entry = find_installed(body.get("detect_name") or body.get("name"), include_system_profile=True)
     if not entry:
         return 0, "설치되어 있지 않음 (삭제할 항목 없음)"
     if entry["product_code"]:

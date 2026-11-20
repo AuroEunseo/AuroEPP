@@ -91,6 +91,9 @@ class PackageCreateRequest(BaseModel):
     detect_name: str = ""
     timeout_min: int = 30
     notes: str = ""
+    description: str = ""
+    self_service: bool = False
+    self_approval: bool = False
 
 
 class PackageUpdateRequest(BaseModel):
@@ -102,6 +105,9 @@ class PackageUpdateRequest(BaseModel):
     detect_name: str = ""
     timeout_min: int = 30
     notes: str = ""
+    description: str = ""
+    self_service: bool = False
+    self_approval: bool = False
 
 
 class DeployRequest(BaseModel):
@@ -115,3 +121,11 @@ class ProgressReport(BaseModel):
     progress: int = 0
     message: str = ""
     exit_code: Optional[int] = None
+
+
+class SelfInstallRequest(BaseModel):
+    user: str = ""  # 설치 센터에서 요청한 Windows 사용자 이름 (기록용)
+
+
+class RejectRequest(BaseModel):
+    reason: str = ""

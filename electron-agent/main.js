@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const os = require('os');
 
 const DATA_DIR = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'AURORA');
 const IDENTITY_FILE = path.join(DATA_DIR, 'identity.json');
@@ -23,6 +24,7 @@ const STARTUP_ARG = '--minimized';
 const START_MINIMIZED = [STARTUP_ARG, '--tray', '--hidden'].some((a) => process.argv.includes(a));
 
 let mainWindow = null;
+let storeWindow = null;
 let tray = null;
 let isQuitting = false;
 
@@ -316,6 +318,120 @@ ipcMain.handle('restart-service', async () => {
 });
 
 // ------------------------------------------------------------------
+// 프로그램 설치 센터 (관리자가 '셀프 설치 허용'으로 공개한 프로그램을 사용자가 직접 설치)
+//  - 목록·아이콘 조회와 설치 요청만 서버에 보낸다. 실제 설치 명령은 서버가 서명해서 서비스에 전달하므로
+//    이 창(트레이 앱)이 직접 설치를 실행하지 않는다.
+// ------------------------------------------------------------------
+function agentRequest(method, apiPath, body, { raw = false, timeout = 8000 } = {}) {
+  return new Promise((resolve) => {
+    const identity = readJsonSafe(IDENTITY_FILE, {});
+    const config = readServerConfig();
+    if (!identity.machine_id || !identity.agent_token) {
+      return resolve({ status: 0, error: '아직 서버에 등록되지 않은 PC입니다. (콘솔에서 승인 후 사용 가능)' });
+    }
+    const payload = body === undefined ? null : JSON.stringify(body);
+    const req = http.request(
+      {
+        hostname: config.server_ip,
+        port: config.server_port,
+        path: apiPath,
+        method,
+        timeout,
+        headers: {
+          'X-Machine-ID': identity.machine_id,
+          'X-Agent-Token': identity.agent_token,
+          ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        let size = 0;
+        res.on('data', (c) => {
+          size += c.length;
+          if (size <= 512 * 1024) chunks.push(c);
+        });
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks);
+          if (raw) return resolve({ status: res.statusCode, buffer: buf, type: String(res.headers['content-type'] || '') });
+          let json = {};
+          try {
+            json = JSON.parse(buf.toString('utf8') || '{}');
+          } catch (e) {}
+          resolve({ status: res.statusCode, json, error: res.statusCode >= 400 ? json.detail || `서버 오류 (${res.statusCode})` : '' });
+        });
+      }
+    );
+    req.on('error', (e) => resolve({ status: 0, error: `관제 서버에 연결할 수 없습니다 (${e.code || e.message})` }));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ status: 0, error: '관제 서버 응답 시간 초과' });
+    });
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+const iconCache = new Map(); // `${id}:${rev}` → data URL
+
+ipcMain.handle('catalog-list', async () => {
+  const r = await agentRequest('GET', '/api/agent/catalog');
+  if (r.error) return { ok: false, error: r.error, items: [] };
+  return { ok: true, items: r.json.items || [] };
+});
+
+ipcMain.handle('catalog-icon', async (_e, { id, rev }) => {
+  const key = `${parseInt(id, 10)}:${parseInt(rev, 10)}`;
+  if (iconCache.has(key)) return iconCache.get(key);
+  const r = await agentRequest('GET', `/api/agent/catalog/${parseInt(id, 10)}/icon`, undefined, { raw: true });
+  let url = '';
+  if (r.status === 200 && r.buffer && r.buffer.length) {
+    const type = r.type.startsWith('image/png') ? 'image/png' : r.type.startsWith('image/x-icon') ? 'image/x-icon' : '';
+    if (type) url = `data:${type};base64,${r.buffer.toString('base64')}`;
+  }
+  iconCache.set(key, url);
+  return url;
+});
+
+ipcMain.handle('catalog-request', async (_e, { id }) => {
+  let user = '';
+  try {
+    user = os.userInfo().username;
+  } catch (e) {}
+  const r = await agentRequest('POST', `/api/agent/catalog/${parseInt(id, 10)}/request`, { user });
+  if (r.error) return { ok: false, error: r.error };
+  return { ok: true, ...r.json };
+});
+
+ipcMain.handle('open-store', () => showStoreWindow());
+
+function showStoreWindow() {
+  if (storeWindow && !storeWindow.isDestroyed()) {
+    if (storeWindow.isMinimized()) storeWindow.restore();
+    storeWindow.show();
+    storeWindow.focus();
+    return;
+  }
+  storeWindow = new BrowserWindow({
+    width: 760,
+    height: 720,
+    minWidth: 560,
+    minHeight: 480,
+    autoHideMenuBar: true,
+    backgroundColor: '#090d16',
+    title: '프로그램 설치 센터',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  storeWindow.on('closed', () => {
+    storeWindow = null;
+  });
+  storeWindow.loadFile(path.join(__dirname, 'store.html'));
+}
+
+// ------------------------------------------------------------------
 // 작업 현황 (서비스가 기록하는 tasks.json → 트레이 메뉴 '진행 중인 작업' / 설정 창)
 // ------------------------------------------------------------------
 const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
@@ -350,6 +466,10 @@ function buildTrayMenu(tasks) {
         : undefined,
     },
     { type: 'separator' },
+    {
+      label: '프로그램 설치 센터 열기',
+      click: () => showStoreWindow(),
+    },
     {
       label: '에이전트 설정 및 작업 현황 열기',
       click: () => showStatusWindow(),

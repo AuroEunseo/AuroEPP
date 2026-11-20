@@ -1,6 +1,6 @@
 {
   "name": "aurora-console",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "AURORA Endpoint Control Management Console",
   "main": "main.js",
   "scripts": {

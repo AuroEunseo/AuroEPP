@@ -27,6 +27,8 @@ pyinstaller --noconfirm --onefile --clean `
     --name "AuroraAgent" `
     --paths "$Root\agent" `
     --hidden-import "win32timezone" `
+    --hidden-import "acl" `
+    --hidden-import "win32security" `
     "$Root\agent\service.py"
 
 Write-Host "=== 빌드 완료! dist 폴더를 확인하세요 ===" -ForegroundColor Green

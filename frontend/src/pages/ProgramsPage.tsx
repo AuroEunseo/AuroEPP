@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Download, Edit3, Package, RefreshCw, ShieldCheck, Trash2, Upload, X } from 'lucide-react';
+import { Check, Download, Edit3, Inbox, Package, RefreshCw, Search, ShieldCheck, Trash2, Upload, X } from 'lucide-react';
 import { apiFetch, errorMessage, getSessionToken } from '../api';
 import { useConsole } from '../context/ConsoleContext';
-import { PackageStatusRow, SoftwarePackage } from '../types';
-import { PackageForm, PackageMeta, metaFromFilename, metaFromPackage } from '../components/programs/PackageForm';
+import { Deployment, PackageStatusRow, SoftwarePackage } from '../types';
+import { IconChange, PackageForm, PackageMeta, metaFromFilename, metaFromPackage } from '../components/programs/PackageForm';
+import { PackageIcon } from '../components/programs/PackageIcon';
 import { DeploymentBadge, isActiveDeployment } from '../components/programs/DeploymentBadge';
 
 interface UploadResult {
@@ -42,6 +43,23 @@ function uploadFile(file: File, onProgress: (pct: number) => void): Promise<Uplo
   });
 }
 
+/** 아이콘 변경 반영 (PNG/ICO 파일 본문을 그대로 전송) */
+async function applyIcon(pid: number, icon: IconChange) {
+  if (icon.file) {
+    const res = await fetch(`/api/packages/${pid}/icon`, {
+      method: 'POST',
+      headers: { 'X-Session-Token': getSessionToken(), 'Content-Type': 'application/octet-stream' },
+      body: icon.file,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`아이콘 저장 실패: ${err.detail || res.status}`);
+    }
+  } else if (icon.remove) {
+    await apiFetch(`/packages/${pid}/icon`, undefined, 'DELETE');
+  }
+}
+
 type Filter = 'all' | 'installed' | 'missing' | 'active' | 'failed';
 
 /** 프로그램 관리: 사내 공용 프로그램 업로드·목록·PC별 설치/삭제 */
@@ -51,6 +69,8 @@ export const ProgramsPage: React.FC = () => {
   const [pkgs, setPkgs] = useState<SoftwarePackage[]>([]);
   const [keyId, setKeyId] = useState('');
   const [error, setError] = useState('');
+  const [query, setQuery] = useState('');
+  const [requests, setRequests] = useState<Deployment[]>([]);
 
   // 업로드 → 정보 입력
   const [uploadPct, setUploadPct] = useState<number | null>(null);
@@ -69,6 +89,8 @@ export const ProgramsPage: React.FC = () => {
       const r = await apiFetch<{ packages: SoftwarePackage[]; signing_key: string }>('/packages');
       setPkgs(r.packages);
       setKeyId(r.signing_key);
+      const q = await apiFetch<{ requests: Deployment[] }>('/package-requests');
+      setRequests(q.requests);
       setError('');
     } catch (e) {
       setError(errorMessage(e));
@@ -122,11 +144,16 @@ export const ProgramsPage: React.FC = () => {
     }
   };
 
-  const createPackage = async (meta: PackageMeta) => {
+  const createPackage = async (meta: PackageMeta, icon: IconChange) => {
     if (!uploaded) return;
     setSaving(true);
     try {
       const r = await apiFetch<{ id: number }>('/packages', { upload_id: uploaded.upload_id, ...meta });
+      try {
+        await applyIcon(r.id, icon);
+      } catch (e) {
+        alert(errorMessage(e));
+      }
       showToast(`✓ '${meta.name}' 프로그램을 등록했습니다.`);
       setUploaded(null);
       await loadList();
@@ -138,11 +165,12 @@ export const ProgramsPage: React.FC = () => {
     }
   };
 
-  const updatePackage = async (meta: PackageMeta) => {
+  const updatePackage = async (meta: PackageMeta, icon: IconChange) => {
     if (!editing) return;
     setSaving(true);
     try {
       await apiFetch(`/packages/${editing.id}`, meta, 'PUT');
+      await applyIcon(editing.id, icon);
       showToast('✓ 프로그램 정보를 수정했습니다. (이후 요청부터 적용)');
       setEditing(null);
       loadList();
@@ -190,6 +218,27 @@ export const ProgramsPage: React.FC = () => {
     }
   };
 
+  const decide = async (d: Deployment, approve: boolean) => {
+    const who = `${d.hostname || d.machine_id} · ${d.package_name} ${d.package_version}`;
+    let reason = '';
+    if (approve) {
+      if (!confirm(`셀프 설치 요청을 승인할까요?\n${who}\n승인하면 해당 PC에 바로 설치를 시작합니다 (꺼져 있으면 다음 부팅 시).`)) return;
+    } else {
+      const r = prompt(`셀프 설치 요청을 거절합니다.\n${who}\n사용자에게 보일 거절 사유 (선택):`, '');
+      if (r === null) return;
+      reason = r;
+    }
+    try {
+      await apiFetch(`/deployments/${d.id}/${approve ? 'approve' : 'reject'}`, approve ? {} : { reason });
+      showToast(approve ? '✓ 승인했습니다. 설치를 시작합니다.' : '요청을 거절했습니다.');
+      loadList();
+      loadStatus();
+      fetchState();
+    } catch (e) {
+      alert(errorMessage(e));
+    }
+  };
+
   const cancel = async (deploymentId: number) => {
     try {
       await apiFetch(`/deployments/${deploymentId}/cancel`, {});
@@ -210,6 +259,13 @@ export const ProgramsPage: React.FC = () => {
       }),
     [rows, filter]
   );
+  const shownPkgs = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return pkgs;
+    return pkgs.filter((p) =>
+      [p.name, p.version, p.publisher, p.filename, p.description, p.notes].some((v) => (v || '').toLowerCase().includes(q))
+    );
+  }, [pkgs, query]);
   const rings = Object.keys(state.policies);
   const allChecked = visibleRows.length > 0 && visibleRows.every((r) => checked.has(r.machine_id));
 
@@ -238,6 +294,54 @@ export const ProgramsPage: React.FC = () => {
       </div>
 
       {error && <div style={{ color: '#f43f5e', fontSize: 12.5, marginBottom: 8 }}>{error}</div>}
+
+      {/* 셀프 설치 승인 대기 */}
+      {requests.length > 0 && (
+        <section className="glass-card panel" style={{ borderColor: 'rgba(251,191,36,0.45)' }}>
+          <div className="panel-header">
+            <h3 className="panel-title">
+              <Inbox size={16} style={{ color: '#fbbf24' }} />
+              <span>셀프 설치 승인 대기 ({requests.length})</span>
+            </h3>
+          </div>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>PC</th>
+                  <th>프로그램</th>
+                  <th>요청</th>
+                  <th style={{ textAlign: 'right' }}>처리</th>
+                </tr>
+              </thead>
+              <tbody>
+                {requests.map((d) => (
+                  <tr key={d.id}>
+                    <td>
+                      <strong>{d.hostname || d.machine_id}</strong>
+                    </td>
+                    <td>
+                      {d.package_name} <span style={{ color: 'var(--text-secondary)' }}>{d.package_version}</span>
+                    </td>
+                    <td style={{ fontSize: 12 }}>
+                      {fmtTs(d.created_at)}
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{d.requested_by}</div>
+                    </td>
+                    <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      <button className="btn btn-emerald" style={{ padding: '4px 10px', fontSize: 11.5 }} onClick={() => decide(d, true)}>
+                        <Check size={12} /> 승인
+                      </button>{' '}
+                      <button className="btn btn-rose" style={{ padding: '4px 10px', fontSize: 11.5 }} onClick={() => decide(d, false)}>
+                        <X size={12} /> 거절
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       {/* 업로드 진행 / 정보 입력 */}
       {uploadPct !== null && (
@@ -279,6 +383,7 @@ export const ProgramsPage: React.FC = () => {
           </div>
           <PackageForm
             kind={editing.kind}
+            pkg={editing}
             initial={metaFromPackage(editing)}
             submitLabel="수정 저장"
             busy={saving}
@@ -290,6 +395,23 @@ export const ProgramsPage: React.FC = () => {
 
       {/* 프로그램 목록 */}
       <section className="glass-card panel">
+        {pkgs.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+            <Search size={14} style={{ color: 'var(--text-muted)' }} />
+            <input
+              className="input-dark"
+              style={{ width: 280 }}
+              placeholder="프로그램 검색 (이름·게시자·파일명·설명)"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            {query && (
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                {shownPkgs.length} / {pkgs.length}개
+              </span>
+            )}
+          </div>
+        )}
         {pkgs.length === 0 ? (
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
             <Package size={28} style={{ marginBottom: 8 }} />
@@ -310,15 +432,25 @@ export const ProgramsPage: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {pkgs.map((p) => (
+                {shownPkgs.map((p) => (
                   <tr
                     key={p.id}
                     onClick={() => setSelId(p.id === selId ? null : p.id)}
                     style={p.id === selId ? { background: 'var(--bg-subcard)' } : undefined}
                   >
                     <td>
-                      <strong>{p.name}</strong> <span style={{ color: 'var(--text-secondary)' }}>{p.version}</span>
-                      <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.filename}</div>
+                      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                        <PackageIcon id={p.id} name={p.name} hasIcon={p.has_icon} rev={p.icon_rev} />
+                        <div>
+                          <strong>{p.name}</strong> <span style={{ color: 'var(--text-secondary)' }}>{p.version}</span>
+                          {p.self_service && (
+                            <span className="badge badge-ok" style={{ marginLeft: 6, fontSize: 10 }}>
+                              설치 센터{p.self_approval ? ' · 승인 필요' : ''}
+                            </span>
+                          )}
+                          <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.filename}</div>
+                        </div>
+                      </div>
                     </td>
                     <td className="mono" style={{ fontSize: 12 }}>
                       {p.kind.toUpperCase()} · {fmtSize(p.size)}
@@ -329,6 +461,7 @@ export const ProgramsPage: React.FC = () => {
                     <td className="mono">{p.installed_count ?? 0}대</td>
                     <td className="mono">
                       {p.active_count ?? 0} / <span style={{ color: p.failed_count ? '#f43f5e' : undefined }}>{p.failed_count ?? 0}</span>
+                      {!!p.requested_count && <div style={{ fontSize: 11, color: '#fbbf24' }}>승인 대기 {p.requested_count}</div>}
                     </td>
                     <td style={{ fontSize: 12 }}>
                       {fmtTs(p.created_at)}
@@ -463,6 +596,16 @@ export const ProgramsPage: React.FC = () => {
                         {d?.exit_code != null && <span className="mono"> (종료 코드 {d.exit_code})</span>}
                       </td>
                       <td style={{ textAlign: 'right' }}>
+                        {d?.status === 'requested' && (
+                          <>
+                            <button className="btn btn-emerald" style={{ padding: '3px 8px', fontSize: 11 }} onClick={() => decide(d, true)}>
+                              <Check size={11} /> 승인
+                            </button>{' '}
+                            <button className="btn btn-ghost" style={{ padding: '3px 8px', fontSize: 11 }} onClick={() => decide(d, false)}>
+                              거절
+                            </button>
+                          </>
+                        )}
                         {d?.status === 'queued' && (
                           <button className="btn btn-ghost" style={{ padding: '3px 8px', fontSize: 11 }} onClick={() => cancel(d.id)}>
                             <X size={11} /> 대기 취소

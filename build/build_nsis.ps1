@@ -35,6 +35,8 @@ pyinstaller --noconfirm --onedir --clean `
     --distpath "$Root\electron-agent\resources" `
     --hidden-import "worker" `
     --hidden-import "win32timezone" `
+    --hidden-import "acl" `
+    --hidden-import "win32security" `
     "$Root\agent\service.py"
 
 Write-Host "=== 4. NSIS 설치 마법사 빌드 (Console & Agent) ===" -ForegroundColor Cyan
